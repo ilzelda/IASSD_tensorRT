@@ -1,0 +1,26 @@
+.git
+.agents
+.codex
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# 데이터셋과 실험 산출물은 이미지에 넣지 않고 volume으로 연결한다.
+data/
+output/
+logs/
+ckpt/
+checkpoints/
+
+# 대형 모델 파일은 필요할 때 volume으로 연결하거나 컨테이너 안에서 별도로 배치한다.
+*.pth
+*.pt
+*.onnx
+*.engine
+*.plan
