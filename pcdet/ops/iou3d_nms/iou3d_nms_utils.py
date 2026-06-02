@@ -38,7 +38,7 @@ def boxes_iou_bev(boxes_a, boxes_b):
         ans_iou: (N, M)
     """
     assert boxes_a.shape[1] == boxes_b.shape[1] == 7
-    ans_iou = torch.cuda.FloatTensor(torch.Size((boxes_a.shape[0], boxes_b.shape[0]))).zero_()
+    ans_iou = boxes_a.new_zeros((boxes_a.shape[0], boxes_b.shape[0]))
 
     iou3d_nms_cuda.boxes_iou_bev_gpu(boxes_a.contiguous(), boxes_b.contiguous(), ans_iou)
 
@@ -63,7 +63,7 @@ def boxes_iou3d_gpu(boxes_a, boxes_b):
     boxes_b_height_min = (boxes_b[:, 2] - boxes_b[:, 5] / 2).view(1, -1)
 
     # bev overlap
-    overlaps_bev = torch.cuda.FloatTensor(torch.Size((boxes_a.shape[0], boxes_b.shape[0]))).zero_()  # (N, M)
+    overlaps_bev = boxes_a.new_zeros((boxes_a.shape[0], boxes_b.shape[0]))  # (N, M)
     iou3d_nms_cuda.boxes_overlap_bev_gpu(boxes_a.contiguous(), boxes_b.contiguous(), overlaps_bev)
 
     max_of_min = torch.max(boxes_a_height_min, boxes_b_height_min)
@@ -94,9 +94,9 @@ def nms_gpu(boxes, scores, thresh, pre_maxsize=None, **kwargs):
         order = order[:pre_maxsize]
 
     boxes = boxes[order].contiguous()
-    keep = torch.LongTensor(boxes.size(0))
+    keep = torch.empty((boxes.size(0),), dtype=torch.long, device=boxes.device)
     num_out = iou3d_nms_cuda.nms_gpu(boxes, keep, thresh)
-    return order[keep[:num_out].cuda()].contiguous(), None
+    return order[keep[:num_out]].contiguous(), None
 
 
 def nms_normal_gpu(boxes, scores, thresh, **kwargs):
@@ -111,6 +111,6 @@ def nms_normal_gpu(boxes, scores, thresh, **kwargs):
 
     boxes = boxes[order].contiguous()
 
-    keep = torch.LongTensor(boxes.size(0))
+    keep = torch.empty((boxes.size(0),), dtype=torch.long, device=boxes.device)
     num_out = iou3d_nms_cuda.nms_normal_gpu(boxes, keep, thresh)
-    return order[keep[:num_out].cuda()].contiguous(), None
+    return order[keep[:num_out]].contiguous(), None

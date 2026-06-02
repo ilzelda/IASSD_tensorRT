@@ -30,7 +30,7 @@ class BallQuery(Function):
 
         B = xyz_batch_cnt.shape[0]
         M = new_xyz.shape[0]
-        idx = torch.cuda.IntTensor(M, nsample).zero_()
+        idx = torch.zeros((M, nsample), dtype=torch.int32, device=xyz.device)
 
         pointnet2.ball_query_wrapper(B, M, radius, nsample, new_xyz, new_xyz_batch_cnt, xyz, xyz_batch_cnt, idx)
         empty_ball_mask = (idx[:, 0] == -1)
@@ -74,7 +74,7 @@ class GroupingOperation(Function):
         M, nsample = idx.size()
         N, C = features.size()
         B = idx_batch_cnt.shape[0]
-        output = torch.cuda.FloatTensor(M, C, nsample)
+        output = features.new_empty((M, C, nsample))
 
         pointnet2.group_points_wrapper(B, M, C, nsample, features, features_batch_cnt, idx, idx_batch_cnt, output)
 
@@ -94,7 +94,7 @@ class GroupingOperation(Function):
         B, N, idx, features_batch_cnt, idx_batch_cnt = ctx.for_backwards
 
         M, C, nsample = grad_out.size()
-        grad_features = Variable(torch.cuda.FloatTensor(N, C).zero_())
+        grad_features = Variable(grad_out.new_zeros((N, C)))
 
         grad_out_data = grad_out.data.contiguous()
         pointnet2.group_points_grad_wrapper(B, M, C, N, nsample, grad_out_data, idx,
@@ -170,8 +170,8 @@ class FarthestPointSampling(Function):
         assert xyz.is_contiguous()
 
         B, N, _ = xyz.size()
-        output = torch.cuda.IntTensor(B, npoint)
-        temp = torch.cuda.FloatTensor(B, N).fill_(1e10)
+        output = torch.empty((B, npoint), dtype=torch.int32, device=xyz.device)
+        temp = xyz.new_full((B, N), 1e10)
 
         pointnet2.farthest_point_sampling_wrapper(B, N, npoint, xyz, temp, output)
         return output
@@ -207,8 +207,8 @@ class StackFarthestPointSampling(Function):
             npoint = torch.tensor(npoint, device=xyz.device).int()
 
         N, _ = xyz.size()
-        temp = torch.cuda.FloatTensor(N).fill_(1e10)
-        output = torch.cuda.IntTensor(npoint.sum().item())
+        temp = xyz.new_full((N,), 1e10)
+        output = torch.empty((npoint.sum().item(),), dtype=torch.int32, device=xyz.device)
 
         pointnet2.stack_farthest_point_sampling_wrapper(xyz, temp, xyz_batch_cnt, output, npoint)
         return output
@@ -348,7 +348,7 @@ class ThreeNNForVectorPoolByTwoStep(Function):
             stack_neighbor_idxs, start_len, num_new_xyz, num_total_grids
         )
 
-        return torch.sqrt(new_xyz_grid_dist2), new_xyz_grid_idxs, torch.tensor(avg_length_of_neighbor_idxs)
+        return torch.sqrt(new_xyz_grid_dist2), new_xyz_grid_idxs, torch.tensor(avg_length_of_neighbor_idxs, device=support_xyz.device)
 
 
 three_nn_for_vector_pool_by_two_step = ThreeNNForVectorPoolByTwoStep.apply
@@ -418,8 +418,8 @@ class VectorPoolWithVoxelQuery(Function):
         if use_xyz:
             new_local_xyz = (new_local_xyz.view(-1, num_total_grids, 3) / normalizer).view(-1, num_total_grids * 3)
 
-        num_mean_points_per_grid = torch.Tensor([num_mean_points_per_grid]).int()
-        nsample = torch.Tensor([nsample]).int()
+        num_mean_points_per_grid = torch.tensor([num_mean_points_per_grid], dtype=torch.int32, device=support_features.device)
+        nsample = torch.tensor([nsample], dtype=torch.int32, device=support_features.device)
         ctx.vector_pool_for_backward = (point_cnt_of_grid, grouped_idxs, N, num_c_in)
         ctx.mark_non_differentiable(new_local_xyz, num_mean_points_per_grid, nsample, point_cnt_of_grid)
         return new_features, new_local_xyz, num_mean_points_per_grid, point_cnt_of_grid
