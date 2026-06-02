@@ -1,11 +1,13 @@
-# AMD/x86_64 서버에서 PyTorch IA-SSD 모델을 ONNX로 export하기 위한 환경이다.
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:22.12-py3
+# AMD/x86_64 서버에서 PyTorch IA-SSD 모델을 최신 ONNX exporter로 변환하기 위한 환경이다.
+ARG BASE_IMAGE=pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
 FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6"
+ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+ARG MAX_JOBS=4
+ARG SPCONV_PACKAGE="spconv-cu121==2.3.8"
 
 ENV TZ=Asia/Seoul \
     LANG=C.UTF-8 \
@@ -14,13 +16,15 @@ ENV TZ=Asia/Seoul \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    MAX_JOBS=${MAX_JOBS} \
     FORCE_CUDA=1 \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib64:${LD_LIBRARY_PATH} \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 WORKDIR /workspace/IA-SSD
 
-# ONNX export와 pcdet extension 빌드에 필요한 기본 도구를 설치한다.
+# ONNX export와 pcdet CUDA extension 빌드에 필요한 기본 도구를 설치한다.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         bash-completion \
@@ -45,33 +49,47 @@ RUN apt-get update && \
         wget && \
     rm -rf /var/lib/apt/lists/*
 
-# IA-SSD/OpenPCDet 계열 코드와 ONNX export/검증에 필요한 Python 패키지를 설치한다.
+# PyTorch 2.5의 torch.onnx.export(..., dynamo=True) 경로와 ONNX 검증 도구를 설치한다.
+# NumPy ABI 충돌을 피하기 위해 binary extension 패키지는 NumPy 1.26 계열에 맞춰 구성한다.
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install \
-        setuptools==59.8.0 \
+        setuptools==69.5.1 \
         wheel \
-        numpy==1.19.5 \
-        llvmlite==0.36.0 \
-        numba==0.53.1 \
-        tensorboardX \
-        easydict \
-        pyyaml \
-        scikit-image \
-        tqdm \
-        SharedArray \
-        scipy \
-        pybind11 \
-        opencv-python-headless \
-        onnx==1.13.1 \
-        onnxsim==0.4.33 \
-        onnxruntime-gpu==1.14.1
+        ninja \
+        packaging && \
+    python3 -m pip install \
+        numpy==1.26.4 \
+        llvmlite==0.43.0 \
+        numba==0.60.0 \
+        tensorboardX==2.6.2.2 \
+        easydict==1.13 \
+        pyyaml==6.0.2 \
+        scikit-image==0.22.0 \
+        tqdm==4.66.5 \
+        scipy==1.11.4 \
+        pybind11==2.13.6 \
+        opencv-python-headless==4.10.0.84 \
+        onnx==1.17.0 \
+        onnxscript==0.1.0 \
+        onnxruntime==1.20.1 \
+        onnxsim==0.4.36
 
-# spconv은 AMD 서버의 CUDA/PyTorch 조합에 맞는 wheel이 있을 때만 설치한다.
-# 설치가 실패해도 export 스크립트에서 실제 필요 여부를 확인하며 진행할 수 있게 둔다.
-RUN python3 -m pip install spconv-cu117 || \
-    echo "spconv-cu117 설치를 건너뜁니다. 필요하면 AMD 서버 CUDA/PyTorch 버전에 맞는 spconv을 별도로 설치하세요."
+# SharedArray는 런타임 NumPy ABI와 맞도록 현재 이미지 안에서 빌드한다.
+RUN python3 -m pip install --no-binary=SharedArray --no-build-isolation SharedArray==3.2.4
 
-RUN echo "export PYTHONPATH=/workspace/IA-SSD:\${PYTHONPATH}" >> /root/.bashrc
+# spconv은 pcdet import 단계에서 필요하므로 설치 실패 시 이미지 빌드를 실패시킨다.
+RUN python3 -m pip install "${SPCONV_PACKAGE}"
+
+# export에 필요한 핵심 import와 dynamo 인자 지원 여부를 빌드 시점에 검증한다.
+RUN python3 -c "import inspect, torch, onnx, onnxscript, onnxruntime, spconv; assert 'dynamo' in inspect.signature(torch.onnx.export).parameters; print('torch', torch.__version__); print('onnx', onnx.__version__); print('onnxruntime', onnxruntime.__version__); print('spconv', getattr(spconv, '__version__', 'unknown'))"
+
+COPY . /workspace/IA-SSD
+
+# 이미지 자체가 바로 export 가능한 상태인지 확인하기 위해 pcdet CUDA extension을 빌드한다.
+RUN python3 setup.py develop --no-deps && \
+    python3 -c "from pcdet.models import build_network; print('pcdet import ok')" && \
+    git config --global --add safe.directory /workspace/IA-SSD && \
+    echo "export PYTHONPATH=/workspace/IA-SSD:\${PYTHONPATH}" >> /root/.bashrc
 
 ENTRYPOINT ["/bin/bash", "-lc"]
 CMD ["cd /workspace/IA-SSD && exec bash"]
