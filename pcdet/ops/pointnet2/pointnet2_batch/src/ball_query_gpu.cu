@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "ball_query_gpu.h"
+#include "ball_query_gpu_raw.h"
 #include "cuda_utils.h"
 
 

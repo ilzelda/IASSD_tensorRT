@@ -53,6 +53,17 @@ docker build -f docker/Dockerfile.target \
   -t ia-ssd-target .
 ```
 
+현재 Orin target에서는 `onnxruntime-gpu==1.16.0` Jetson wheel이 import와 CUDA/TensorRT provider 확인을 통과했다. NVIDIA Box URL처럼 URL의 마지막 파일명이 wheel 규칙과 맞지 않는 경우가 있어 Dockerfile은 URL을 `ONNXRUNTIME_GPU_WHEEL_NAME` 이름으로 내려받은 뒤 설치한다.
+
+```shell
+docker build -f docker/Dockerfile.target \
+  --build-arg ONNXRUNTIME_GPU_WHEEL_URL=https://nvidia.box.com/shared/static/iizg3ggrtdkqawkmebbfixo7sce6j365.whl \
+  --build-arg ONNXRUNTIME_GPU_WHEEL_NAME=onnxruntime_gpu-1.16.0-cp38-cp38-linux_aarch64.whl \
+  -t ia-ssd-target .
+```
+
+Orin의 compute capability는 `8.7`이므로 target extension과 ORT custom op는 `TORCH_CUDA_ARCH_LIST=8.7` 또는 기본값에 포함된 `8.7`로 빌드해야 한다.
+
 ## 산출물 흐름
 
 ```text

@@ -8,11 +8,53 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import types
 
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file
 from pcdet.datasets import DatasetTemplate
-from pcdet.models import build_network
 from pcdet.utils import common_utils
+
+
+def install_spconv_import_stub():
+    try:
+        import spconv  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    class SparseConvolution(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            raise RuntimeError('이 export 환경에는 spconv이 설치되어 있지 않아 sparse convolution 모델은 실행할 수 없습니다.')
+
+    class SparseModule(nn.Module):
+        pass
+
+    class SparseConvTensor:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError('이 export 환경에는 spconv이 설치되어 있지 않아 SparseConvTensor를 사용할 수 없습니다.')
+
+    spconv_stub = types.ModuleType('spconv')
+    spconv_pytorch_stub = types.ModuleType('spconv.pytorch')
+    conv_stub = types.SimpleNamespace(SparseConvolution=SparseConvolution)
+
+    for module in (spconv_stub, spconv_pytorch_stub):
+        module.conv = conv_stub
+        module.SparseModule = SparseModule
+        module.SparseSequential = nn.Sequential
+        module.SparseConvTensor = SparseConvTensor
+        module.SubMConv3d = SparseConvolution
+        module.SparseConv3d = SparseConvolution
+        module.SparseInverseConv3d = SparseConvolution
+
+    import sys
+    sys.modules['spconv'] = spconv_stub
+    sys.modules['spconv.pytorch'] = spconv_pytorch_stub
+
+
+install_spconv_import_stub()
+
+from pcdet.models import build_network
 
 
 class ExportDataset(DatasetTemplate):

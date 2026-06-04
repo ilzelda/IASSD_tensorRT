@@ -7,8 +7,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG ROS_DISTRO=noetic
-ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6"
+ARG TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.7"
 ARG ONNXRUNTIME_GPU_WHEEL_URL=""
+ARG ONNXRUNTIME_GPU_WHEEL_NAME="onnxruntime_gpu-1.16.0-cp38-cp38-linux_aarch64.whl"
 
 ENV TZ=Asia/Seoul \
     LANG=C.UTF-8 \
@@ -111,7 +112,13 @@ RUN python3 -c "import torch; print(torch.__version__); print(torch.cuda.is_avai
 
 # Jetson용 ONNX Runtime GPU wheel은 JetPack/L4T 버전에 맞는 파일을 명시적으로 넣을 때만 설치한다.
 RUN if [ -n "${ONNXRUNTIME_GPU_WHEEL_URL}" ]; then \
-        python3 -m pip install "${ONNXRUNTIME_GPU_WHEEL_URL}"; \
+        if [[ "${ONNXRUNTIME_GPU_WHEEL_URL}" == http://* || "${ONNXRUNTIME_GPU_WHEEL_URL}" == https://* ]]; then \
+            wget -q "${ONNXRUNTIME_GPU_WHEEL_URL}" -O "/tmp/${ONNXRUNTIME_GPU_WHEEL_NAME}" && \
+            python3 -m pip install "/tmp/${ONNXRUNTIME_GPU_WHEEL_NAME}" && \
+            rm -f "/tmp/${ONNXRUNTIME_GPU_WHEEL_NAME}"; \
+        else \
+            python3 -m pip install "${ONNXRUNTIME_GPU_WHEEL_URL}"; \
+        fi; \
     else \
         echo "ONNXRUNTIME_GPU_WHEEL_URL이 비어 있어 Jetson용 onnxruntime-gpu 설치를 건너뜁니다."; \
     fi

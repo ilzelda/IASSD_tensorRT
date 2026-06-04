@@ -314,6 +314,111 @@ docker run --rm --gpus all \
 - float 출력은 tolerance 기반 비교
 - `onnxruntime.InferenceSession(..., providers=["CUDAExecutionProvider"])`에서 custom op library 로드
 
+진행 기록:
+
+- 상태: 완료
+- 진행일: 2026-06-04
+- `tools/iassd_ort_ops/`에 ONNX Runtime custom op 공유 라이브러리 소스 골격을 추가했다.
+- `tools/iassd_ort_ops/farthest_point_sampling_op.cc`에 `IASSD::FarthestPointSampling` CUDAExecutionProvider custom op를 추가했다.
+- 해당 custom op는 `npoint_i` attribute를 우선 읽고, 수동 작성 ONNX graph 호환을 위해 `npoint` fallback도 지원한다.
+- FPS kernel 실행은 3단계에서 분리한 `sampling_gpu_raw.h`의 `farthest_point_sampling_kernel_launcher(...)`를 재사용한다.
+- `tools/test_iassd_ort_fps.py`에 단일 custom node ONNX graph를 생성하고 PyTorch extension 출력과 ORT custom op 출력을 exact match로 비교하는 단위 테스트를 추가했다.
+- target `ia-ssd-target:latest` 이미지에서 `IASSD::FarthestPointSampling` ORT custom op 단위 테스트가 통과했다.
+- 같은 shared library에 `IASSD::GatherPoints` CUDAExecutionProvider custom op를 추가했다.
+- GatherPoints kernel 실행은 3단계에서 분리한 `sampling_gpu_raw.h`의 `gather_points_kernel_launcher_fast(...)`를 재사용한다.
+- `tools/test_iassd_ort_gather.py`에 단일 custom node ONNX graph를 생성하고 PyTorch extension 출력과 ORT custom op 출력을 exact match로 비교하는 단위 테스트를 추가했다.
+- target `ia-ssd-target:latest` 이미지에서 `IASSD::FarthestPointSampling` regression과 `IASSD::GatherPoints` ORT custom op 단위 테스트가 모두 통과했다.
+- `pcdet/ops/pointnet2/pointnet2_batch/src/ball_query_gpu_raw.h`를 추가해 BallQuery 계열 포인터 기반 CUDA launcher 선언을 Torch 헤더 의존성 없이 분리했다.
+- 같은 shared library에 `IASSD::BallQuery` CUDAExecutionProvider custom op를 추가했다.
+- BallQuery kernel 실행은 새 raw header의 `ball_query_kernel_launcher_fast(...)`를 재사용한다.
+- `tools/test_iassd_ort_ball_query.py`에 단일 custom node ONNX graph를 생성하고 PyTorch extension 출력과 ORT custom op 출력을 exact match로 비교하는 단위 테스트를 추가했다.
+- target `ia-ssd-target:latest` 이미지에서 `IASSD::FarthestPointSampling`, `IASSD::GatherPoints`, `IASSD::BallQuery` ORT custom op 단위 테스트가 모두 통과했다.
+- `pcdet/ops/pointnet2/pointnet2_batch/src/group_points_gpu_raw.h`를 추가해 GroupPoints 계열 포인터 기반 CUDA launcher 선언을 Torch 헤더 의존성 없이 분리했다.
+- 같은 shared library에 `IASSD::GroupPoints` CUDAExecutionProvider custom op를 추가했다.
+- GroupPoints kernel 실행은 새 raw header의 `group_points_kernel_launcher_fast(...)`를 재사용한다.
+- `tools/test_iassd_ort_group.py`에 단일 custom node ONNX graph를 생성하고 PyTorch extension 출력과 ORT custom op 출력을 exact match로 비교하는 단위 테스트를 추가했다.
+- target `ia-ssd-target:latest` 이미지에서 1차 custom op 범위인 `IASSD::FarthestPointSampling`, `IASSD::GatherPoints`, `IASSD::BallQuery`, `IASSD::GroupPoints` 단위 테스트가 모두 통과했다.
+- target GPU는 Orin, compute capability는 `8.7`이다. 기존 Docker 기본값에는 `8.7`이 없어 PyTorch extension 실행 시 `no kernel image is available for execution on the device`가 발생했으므로 `docker/Dockerfile.target`과 `docker/Dockerfile`의 `TORCH_CUDA_ARCH_LIST` 기본값에 `8.7`을 추가했다.
+- `tools/iassd_ort_ops/CMakeLists.txt`는 `TORCH_CUDA_ARCH_LIST`를 읽어 CMake CUDA architecture 값으로 변환한다.
+- Jetson용 `onnxruntime-gpu==1.16.0` wheel은 import와 `CUDAExecutionProvider`, `TensorrtExecutionProvider` 확인이 통과했지만 pip wheel 안에 custom op 빌드용 C++ header와 `libonnxruntime.so`가 없었다.
+- custom op 빌드는 ONNX Runtime `v1.16.0` source header를 `ONNXRUNTIME_INCLUDE_DIR`로 넘기고, `libonnxruntime.so` 명시 링크 없이 ORT가 전달하는 `OrtApi`로 동작하게 했다.
+- `tools/iassd_ort_ops/farthest_point_sampling_op.cc`는 `ORT_API_MANUAL_INIT`과 `Ort::InitApi(api)`를 사용해 pip wheel 환경의 `OrtGetApiBase` 미해결 심볼 문제를 해결했다.
+- `pcdet/ops/onnx_custom_ops.py`는 target PyTorch 2.0 환경에서 `onnxscript`와 `torch.library.custom_op`가 없어도 일반 PyTorch forward가 동작하도록 export 전용 의존성을 fallback 처리했다.
+- `tools/test_iassd_ort_fps.py`는 repo root에서 직접 실행해도 `pcdet`를 import할 수 있게 경로 설정을 자체 처리한다.
+
+빌드 및 검증 명령:
+
+```bash
+cd /workspace/IA-SSD
+git config --global --add safe.directory /workspace/IA-SSD
+wget -q https://nvidia.box.com/shared/static/iizg3ggrtdkqawkmebbfixo7sce6j365.whl \
+  -O /tmp/onnxruntime_gpu-1.16.0-cp38-cp38-linux_aarch64.whl
+python3 -m pip install /tmp/onnxruntime_gpu-1.16.0-cp38-cp38-linux_aarch64.whl
+wget -q https://github.com/microsoft/onnxruntime/archive/refs/tags/v1.16.0.tar.gz \
+  -O /tmp/onnxruntime-v1.16.0.tar.gz
+mkdir -p /tmp/ort_src
+tar -xzf /tmp/onnxruntime-v1.16.0.tar.gz -C /tmp/ort_src --strip-components=1
+TORCH_CUDA_ARCH_LIST=8.7 MAX_JOBS=2 python3 setup.py build_ext --force --inplace
+TORCH_CUDA_ARCH_LIST=8.7 cmake -S tools/iassd_ort_ops -B /tmp/iassd_ort_ops_build \
+  -DONNXRUNTIME_INCLUDE_DIR=/tmp/ort_src/include/onnxruntime/core/session
+cmake --build /tmp/iassd_ort_ops_build -j2
+python3 tools/test_iassd_ort_fps.py \
+  --ort_op_library /tmp/iassd_ort_ops_build/libiassd_ort_ops.so \
+  --batch_size 1 \
+  --num_points 512 \
+  --npoint 64 \
+  --device cuda
+python3 tools/test_iassd_ort_gather.py \
+  --ort_op_library /tmp/iassd_ort_ops_build/libiassd_ort_ops.so \
+  --batch_size 1 \
+  --channels 4 \
+  --num_points 512 \
+  --npoint 64 \
+  --device cuda
+python3 tools/test_iassd_ort_ball_query.py \
+  --ort_op_library /tmp/iassd_ort_ops_build/libiassd_ort_ops.so \
+  --batch_size 1 \
+  --num_points 512 \
+  --npoint 64 \
+  --radius 0.2 \
+  --nsample 16 \
+  --device cuda
+python3 tools/test_iassd_ort_group.py \
+  --ort_op_library /tmp/iassd_ort_ops_build/libiassd_ort_ops.so \
+  --batch_size 1 \
+  --channels 4 \
+  --num_points 512 \
+  --npoint 64 \
+  --nsample 16 \
+  --device cuda
+```
+
+검증 결과:
+
+- 실행일: 2026-06-04
+- Docker image: `ia-ssd-target:latest`
+- PyTorch: `2.0.0a0+ec3941ad.nv23.02`
+- ONNX Runtime GPU: `1.16.0`
+- ORT providers: `TensorrtExecutionProvider`, `CUDAExecutionProvider`, `CPUExecutionProvider`
+- GPU: Orin, compute capability `(8, 7)`
+- 테스트 입력: `input_shape=(1, 512, 3)`, `npoint=64`
+- 테스트 출력: `output_shape=(1, 64)`
+- 결과: `IASSD::FarthestPointSampling ORT custom op 테스트 통과`
+- GatherPoints 테스트 입력: `features_shape=(1, 4, 512)`, `idx_shape=(1, 64)`
+- GatherPoints 테스트 출력: `output_shape=(1, 4, 64)`
+- 결과: `IASSD::GatherPoints ORT custom op 테스트 통과`
+- BallQuery 테스트 입력: `xyz_shape=(1, 512, 3)`, `new_xyz_shape=(1, 64, 3)`, `radius=0.2`, `nsample=16`
+- BallQuery 테스트 출력: `idx_shape=(1, 64, 16)`
+- 결과: `IASSD::BallQuery ORT custom op 테스트 통과`
+- GroupPoints 테스트 입력: `features_shape=(1, 4, 512)`, `idx_shape=(1, 64, 16)`
+- GroupPoints 테스트 출력: `output_shape=(1, 4, 64, 16)`
+- 결과: `IASSD::GroupPoints ORT custom op 테스트 통과`
+
+주의:
+
+- 테스트는 `CUDAExecutionProvider`를 요구하므로 Python 패키지는 CPU 전용 `onnxruntime`이 아니라 CUDA EP가 포함된 ONNX Runtime 빌드 또는 `onnxruntime-gpu` 계열이어야 한다.
+- custom op ABI는 ONNX Runtime 버전의 영향을 받으므로 최종 `.so`는 target machine의 ONNX Runtime/CUDA 환경에서 다시 빌드한다.
+
 ### 5단계: 모델 단위 ORT 검증
 
 산출물:
@@ -328,6 +433,71 @@ docker run --rm --gpus all \
 - shape 일치
 - max/mean absolute error 기록
 - 최종 post-processing은 Python/PyTorch 경로로 붙여 box 결과 비교
+
+진행 기록:
+
+- 상태: 진행 중
+- 진행일: 2026-06-04
+- `tools/validate_iassd_ort_model.py`를 추가해 KITTI IA-SSD PyTorch raw output과 ONNX Runtime output의 shape 및 absolute error를 비교할 수 있게 했다.
+- target image에는 `spconv`이 없지만 IA-SSD KITTI 경로는 sparse convolution을 직접 만들지 않으므로, 검증 스크립트에서 import 전용 `spconv` stub을 설치해 `pcdet.models` import를 통과시킨다.
+- OpenPCDet config의 `_BASE_CONFIG_`가 `tools/` 기준 상대경로를 사용하므로 config load 시 작업 디렉터리를 일시적으로 `tools/`로 전환한다.
+- 전체 모델 ORT 실행 중 `GatherPoints`의 index 입력이 깨져 CUDA illegal memory access가 발생했다. 원인은 `TopK`/`Cast`에서 만들어진 index tensor를 custom CUDA op에서 device pointer로 가정한 것이다.
+- `IASSD::GatherPoints`와 `IASSD::GroupPoints`는 index 입력을 `OrtMemTypeCPUInput`으로 명시하고, kernel 호출 직전에 CPU index를 int32 CUDA buffer로 복사하도록 수정했다.
+- 이 수정 이후 1차 custom op 단위 테스트 4개가 모두 다시 통과했고, KITTI IA-SSD ONNX graph가 `CUDAExecutionProvider`에서 끝까지 실행됐다.
+- `tools/trace_iassd_ort_parity.py`를 추가해 ONNX graph에 중간 tensor를 임시 output으로 붙이고 PyTorch `encoder_xyz`, `encoder_features`, `sa_ins_preds`, `TopK` index와 비교할 수 있게 했다.
+- 중간 tensor trace 결과, 첫 두 FPS/Gather sampling과 첫 SA feature는 exact 또는 매우 작은 오차로 일치했다.
+- 최초로 큰 좌표 차이가 생기는 지점은 `TopK` 기반 sampling 이후의 `gather_points_2`이다.
+- `sa_ins_score_1`과 ONNX `sigmoid`는 max abs `1.2194737792015076e-05`, mean abs `5.297447280838696e-08`로 거의 일치하지만, `topk_indices_0`과 ONNX `_to_copy_1`은 달랐다.
+- 따라서 현재 큰 box 오차의 직접 원인은 custom op kernel의 큰 수치 오류보다는 PyTorch `torch.topk`와 ONNX Runtime `TopK`가 동점 또는 근접 score에서 다른 index를 선택하는 sampling divergence로 판단한다.
+- `pcdet/ops/pointnet2/pointnet2_batch/pointnet2_modules.py`의 `TopK` sampling 직전에 `1e-7 * index` tie-breaker를 score에서 빼는 deterministic index 우선순위를 추가했다.
+- target image의 PyTorch `2.0.0a0+ec3941ad.nv23.02`에는 stage2 export에서 사용한 `torch.onnx._internal.exporter` API가 없어, target 안에서는 tie-breaker가 포함된 ONNX를 재export할 수 없었다.
+- 기존 ONNX graph에 사후로 `Sub(score, index_bias)`를 삽입하는 방식도 시험했지만, 첫 FPS/Gather output까지 깨지는 부작용이 확인되어 폐기했다.
+- 다음 검증은 PyTorch 2.5 계열 export 환경에서 stage2 ONNX를 재생성한 뒤 `tools/trace_iassd_ort_parity.py`로 `topk_indices_0/_to_copy_1`, `topk_indices_1/_to_copy_2`가 실제로 일치하는지 확인해야 한다.
+
+검증 명령:
+
+```bash
+cd /workspace/IA-SSD
+IASSD_DEBUG_RANGE_CHECK=1 python3 tools/validate_iassd_ort_model.py \
+  --cfg_file tools/cfgs/kitti_models/IA-SSD.yaml \
+  --ckpt tools/IA-SSD.pth \
+  --onnx_file onnx_exports/stage2/ia_ssd_kitti_with_iassd_opset.onnx \
+  --ort_op_library /tmp/iassd_ort_ops_build/libiassd_ort_ops.so \
+  --num_points 16384 \
+  --device cuda \
+  --providers CUDAExecutionProvider \
+  --report_file onnx_exports/stage5/kitti_ort_cuda_parity_report.json
+```
+
+중간 tensor trace 명령:
+
+```bash
+cd /workspace/IA-SSD
+IASSD_DEBUG_RANGE_CHECK=1 python3 tools/trace_iassd_ort_parity.py \
+  --cfg_file tools/cfgs/kitti_models/IA-SSD.yaml \
+  --ckpt tools/IA-SSD.pth \
+  --onnx_file onnx_exports/stage2/ia_ssd_kitti_with_iassd_opset.onnx \
+  --ort_op_library /tmp/iassd_ort_ops_build/libiassd_ort_ops.so \
+  --num_points 16384 \
+  --providers CUDAExecutionProvider \
+  --report_file onnx_exports/stage5/kitti_ort_cuda_trace_report.json
+```
+
+검증 결과:
+
+- 실행일: 2026-06-04
+- Docker image: `ia-ssd-target:latest`
+- 입력 `points`: `(16384, 5)`, `torch.float32`, `cuda:0`
+- `batch_cls_preds`: PyTorch `(256, 3)`, ORT `(256, 3)`, shape 일치
+- `batch_cls_preds` 오차: max abs `2.86238956451416`, mean abs `0.03077808301895857`
+- `batch_box_preds`: PyTorch `(256, 7)`, ORT `(256, 7)`, shape 일치
+- `batch_box_preds` 오차: max abs `50.89475631713867`, mean abs `0.12930782358307624`
+
+남은 작업:
+
+- shape와 runtime은 통과했지만 numerical parity 오차가 아직 크므로, 다음 단계에서 PyTorch `topk`와 ONNX Runtime `TopK`의 tie-breaking 차이를 줄이는 방식을 결정한다.
+- 1차 후보는 이미 core에 반영한 deterministic index tie-breaker를 포함해 ONNX를 재export하는 방식이다. 이 검증이 실패할 경우 `TopK` sampling도 `IASSD::TopKSampling` custom op로 분리하는 방식을 검토한다.
+- index CPU 왕복 복사는 정확도 검증 우선의 임시 안정화 경로다. benchmark 단계 전에는 ORT CUDA tensor memory 처리 방식에 맞춰 device index 경로를 최적화할지 결정한다.
 
 ### 6단계: TensorRT plugin 구현
 
@@ -412,6 +582,6 @@ docker run --rm --gpus all \
 
 ## 다음 액션
 
-다음 구현 작업은 `IASSD::FarthestPointSampling` ONNX Runtime custom op 단위 테스트를 만드는 것이다. `sampling_gpu_raw.h`에 분리한 `farthest_point_sampling_kernel_launcher(...)`를 재사용하고, ORT session이 `IASSD:FarthestPointSampling`을 등록된 custom op로 인식하는지 검증한다.
+다음 작업은 PyTorch 2.5 계열 export 환경에서 deterministic TopK tie-breaker가 포함된 KITTI IA-SSD ONNX graph를 재생성하고, target에서 `tools/trace_iassd_ort_parity.py`로 TopK index와 final raw output parity를 다시 확인하는 것이다.
 
 최종 ORT/TensorRT binary와 benchmark는 target machine에서 다시 빌드/검증한다.

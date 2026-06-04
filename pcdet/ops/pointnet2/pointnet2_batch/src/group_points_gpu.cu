@@ -8,7 +8,7 @@ All Rights Reserved 2018.
 #include <stdlib.h>
 
 #include "cuda_utils.h"
-#include "group_points_gpu.h"
+#include "group_points_gpu_raw.h"
 
 
 __global__ void group_points_grad_kernel_fast(int b, int c, int n, int npoints, int nsample, 

@@ -234,6 +234,8 @@ class PointnetSAModuleMSG_WithSampling(_PointnetSAModuleBase):
         else:
             self.confidence_layers = None
 
+        self.topk_tiebreaker_eps = 1.0e-7
+
 
     def forward(self, xyz: torch.Tensor, features: torch.Tensor = None, cls_features: torch.Tensor = None, new_xyz=None, ctr_xyz=None):
         """
@@ -276,6 +278,13 @@ class PointnetSAModuleMSG_WithSampling(_PointnetSAModuleBase):
                 elif ('cls' in sample_type) or ('ctr' in sample_type):
                     cls_features_max, class_pred = cls_features_tmp.max(dim=-1)
                     score_pred = torch.sigmoid(cls_features_max) # B,N
+                    # PyTorch와 ONNX Runtime TopK의 동점 처리 차이를 줄이기 위해 낮은 index에 아주 작은 우선순위를 준다.
+                    index_tiebreaker = torch.arange(
+                        score_pred.shape[-1],
+                        device=score_pred.device,
+                        dtype=score_pred.dtype
+                    ).view(1, -1) * self.topk_tiebreaker_eps
+                    score_pred = score_pred - index_tiebreaker
                     score_picked, sample_idx = torch.topk(score_pred, npoint, dim=-1)           
                     sample_idx = sample_idx.int()
 
