@@ -25,6 +25,7 @@ class IASSD_Backbone(nn.Module):
         self.aggregation_mlps = sa_config.get('AGGREGATION_MLPS', None)
         self.confidence_mlps = sa_config.get('CONFIDENCE_MLPS', None)
         self.max_translate_range = sa_config.get('MAX_TRANSLATE_RANGE', None)
+        self.save_sample_list = bool(sa_config.get('SAVE_SAMPLE_LIST', False))
 
 
         for k in range(sa_config.NSAMPLE_LIST.__len__()):
@@ -161,7 +162,7 @@ class IASSD_Backbone(nn.Module):
         
         
         ###save per frame 
-        if self.model_cfg.SA_CONFIG.get('SAVE_SAMPLE_LIST',False) and not self.training:  
+        if self.save_sample_list and not self.training:  
             import numpy as np 
             result_dir = np.load('/home/yifan/tmp.npy', allow_pickle=True)
             for i in range(batch_size)  :

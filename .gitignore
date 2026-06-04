@@ -3,6 +3,7 @@
 **egg-info**
 **dist**
 output/
+onnx_exports/
 spconv/
 *.pyc
 venv/

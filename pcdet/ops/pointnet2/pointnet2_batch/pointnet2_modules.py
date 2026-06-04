@@ -348,7 +348,10 @@ class PointnetSAModuleMSG_WithSampling(_PointnetSAModuleBase):
 
                 sampled_idx_list.append(sample_idx)
 
-            sampled_idx_list = torch.cat(sampled_idx_list, dim=-1) 
+            if len(sampled_idx_list) == 1:
+                sampled_idx_list = sampled_idx_list[0]
+            else:
+                sampled_idx_list = torch.cat(sampled_idx_list, dim=-1)
             new_xyz = pointnet2_utils.gather_operation(xyz_flipped, sampled_idx_list).transpose(1, 2).contiguous()
 
         else:

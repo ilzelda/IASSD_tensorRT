@@ -836,6 +836,9 @@ class IASSD_Head(PointHeadTemplate):
 
             ret_dict['point_box_preds'] = point_box_preds
 
-        self.forward_ret_dict = ret_dict
+        from ...ops.onnx_custom_ops import is_export_placeholders_enabled
+
+        if not is_export_placeholders_enabled():
+            self.forward_ret_dict = ret_dict
 
         return batch_dict

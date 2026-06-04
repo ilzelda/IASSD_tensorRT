@@ -21,6 +21,11 @@ class FarthestPointSampling(Function):
         """
         assert xyz.is_contiguous()
 
+        from pcdet.ops.onnx_custom_ops import farthest_point_sampling, is_export_placeholders_enabled
+
+        if is_export_placeholders_enabled():
+            return farthest_point_sampling(xyz, npoint)
+
         B, N, _ = xyz.size()
         output = torch.empty((B, npoint), dtype=torch.int32, device=xyz.device)
         temp = xyz.new_full((B, N), 1e10)
@@ -77,6 +82,11 @@ class GatherOperation(Function):
         """
         assert features.is_contiguous()
         assert idx.is_contiguous()
+
+        from pcdet.ops.onnx_custom_ops import gather_points, is_export_placeholders_enabled
+
+        if is_export_placeholders_enabled():
+            return gather_points(features, idx)
 
         B, npoint = idx.size()
         _, C, N = features.size()
@@ -195,6 +205,11 @@ class GroupingOperation(Function):
         assert features.is_contiguous()
         assert idx.is_contiguous()
 
+        from pcdet.ops.onnx_custom_ops import group_points, is_export_placeholders_enabled
+
+        if is_export_placeholders_enabled():
+            return group_points(features, idx)
+
         B, nfeatures, nsample = idx.size()
         _, C, N = features.size()
         output = features.new_empty((B, C, nfeatures, nsample))
@@ -240,6 +255,11 @@ class BallQuery(Function):
         """
         assert new_xyz.is_contiguous()
         assert xyz.is_contiguous()
+
+        from pcdet.ops.onnx_custom_ops import ball_query, is_export_placeholders_enabled
+
+        if is_export_placeholders_enabled():
+            return ball_query(xyz, new_xyz, radius, nsample)
 
         B, N, _ = xyz.size()
         npoint = new_xyz.size(1)

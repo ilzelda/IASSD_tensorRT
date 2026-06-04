@@ -2,6 +2,7 @@ import _init_path
 
 import argparse
 import glob
+import json
 from pathlib import Path
 
 import numpy as np
@@ -95,6 +96,14 @@ def parse_config():
     parser.add_argument('--num_points', type=int, default=65536, help='synthetic 입력 생성 시 포인트 수')
     parser.add_argument('--device', type=str, default='cuda', help='export에 사용할 장치')
     parser.add_argument('--opset_version', type=int, default=17, help='ONNX opset 버전')
+    parser.add_argument('--shape_report_file', type=str, default=None,
+                        help='입력과 NMS 전 raw 출력 shape를 저장할 JSON 경로')
+    parser.add_argument('--dump_raw_output_file', type=str, default=None,
+                        help='NMS 전 raw 출력 tensor를 저장할 NPZ 경로')
+    parser.add_argument('--skip_export', action='store_true',
+                        help='raw forward 검증만 수행하고 ONNX export를 건너뜀')
+    parser.add_argument('--use_iassd_custom_ops', action='store_true',
+                        help='IA-SSD custom ONNX op placeholder 경로로 export')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
                         help='추가 config override')
 
@@ -112,6 +121,107 @@ def build_example_batch(export_dataset):
     batch_dict = export_dataset.collate_batch([sample_dict])
     points = torch.from_numpy(batch_dict['points']).float()
     return points
+
+
+def describe_tensor(tensor):
+    return {
+        'shape': list(tensor.shape),
+        'dtype': str(tensor.dtype),
+        'device': str(tensor.device),
+    }
+
+
+def write_shape_report(path, args, example_points, raw_outputs):
+    report_path = Path(path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    report = {
+        'cfg_file': args.cfg_file,
+        'ckpt': args.ckpt,
+        'sample_data_path': args.sample_data_path,
+        'num_points': args.num_points,
+        'device': args.device,
+        'input_points': describe_tensor(example_points),
+        'outputs': {
+            name: describe_tensor(tensor)
+            for name, tensor in raw_outputs.items()
+        },
+    }
+
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')
+
+
+def dump_raw_outputs(path, raw_outputs):
+    dump_path = Path(path)
+    dump_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        dump_path,
+        **{
+            name: tensor.detach().cpu().numpy()
+            for name, tensor in raw_outputs.items()
+        },
+    )
+
+
+def sanitize_onnx_ir_bool_int_attrs(onnx_program):
+    model = getattr(onnx_program, 'model', None)
+    if model is None:
+        return 0
+
+    graphs = [model.graph]
+    graphs.extend(getattr(model, 'functions', {}).values())
+
+    fixed_count = 0
+    for graph in graphs:
+        for node in graph:
+            for attr in getattr(node, 'attributes', {}).values():
+                attr_type = getattr(attr, 'type', None)
+                if getattr(attr_type, 'name', None) == 'INT' and isinstance(getattr(attr, 'value', None), bool):
+                    attr.value = int(attr.value)
+                    fixed_count += 1
+
+    return fixed_count
+
+
+def ensure_iassd_opset_import(onnx_program):
+    model = getattr(onnx_program, 'model', None)
+    if model is None:
+        return False
+
+    opset_imports = getattr(model, 'opset_imports', None)
+    if opset_imports is None:
+        return False
+
+    if opset_imports.get('IASSD') == 1:
+        return False
+
+    opset_imports['IASSD'] = 1
+    return True
+
+
+def export_with_iassd_custom_ops(wrapper, example_points, output_path, logger):
+    from torch.onnx._internal.exporter import _core
+
+    from pcdet.ops.onnx_custom_ops import build_iassd_onnx_registry, export_placeholders_enabled
+
+    logger.info('IA-SSD custom ONNX op placeholder 경로를 사용합니다.')
+    logger.info('PyTorch 2.5 내부 ONNX exporter API를 사용하므로 opset_version 인자는 이 경로에서 적용되지 않을 수 있습니다.')
+
+    registry = build_iassd_onnx_registry()
+    with torch.no_grad(), export_placeholders_enabled():
+        onnx_program = _core.export(
+            wrapper,
+            (example_points,),
+            registry=registry,
+            input_names=['points'],
+            output_names=['batch_cls_preds', 'batch_box_preds'],
+        )
+    fixed_count = sanitize_onnx_ir_bool_int_attrs(onnx_program)
+    if fixed_count:
+        logger.info('ONNX IR bool-valued INT attribute 보정 완료: %d개', fixed_count)
+    if ensure_iassd_opset_import(onnx_program):
+        logger.info('IASSD custom op domain opset import 추가 완료: IASSD=1')
+    onnx_program.save(output_path)
 
 
 def main():
@@ -143,18 +253,44 @@ def main():
     wrapper.eval()
 
     logger.info('예제 입력 points shape: %s', tuple(example_points.shape))
+
+    with torch.no_grad():
+        batch_cls_preds, batch_box_preds = wrapper(example_points)
+
+    raw_outputs = {
+        'batch_cls_preds': batch_cls_preds,
+        'batch_box_preds': batch_box_preds,
+    }
+    logger.info('raw batch_cls_preds shape: %s', tuple(batch_cls_preds.shape))
+    logger.info('raw batch_box_preds shape: %s', tuple(batch_box_preds.shape))
+
+    if args.shape_report_file is not None:
+        write_shape_report(args.shape_report_file, args, example_points, raw_outputs)
+        logger.info('shape report 저장 완료: %s', args.shape_report_file)
+
+    if args.dump_raw_output_file is not None:
+        dump_raw_outputs(args.dump_raw_output_file, raw_outputs)
+        logger.info('raw output 저장 완료: %s', args.dump_raw_output_file)
+
+    if args.skip_export:
+        logger.info('--skip_export가 지정되어 ONNX export를 건너뜁니다.')
+        return
+
     logger.info('ONNX export 시작: %s', output_path)
 
     with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (example_points,),
-            str(output_path),
-            opset_version=args.opset_version,
-            input_names=['points'],
-            output_names=['batch_cls_preds', 'batch_box_preds'],
-            dynamo=True,
-        )
+        if args.use_iassd_custom_ops:
+            export_with_iassd_custom_ops(wrapper, example_points, output_path, logger)
+        else:
+            torch.onnx.export(
+                wrapper,
+                (example_points,),
+                str(output_path),
+                opset_version=args.opset_version,
+                input_names=['points'],
+                output_names=['batch_cls_preds', 'batch_box_preds'],
+                dynamo=True,
+            )
 
     logger.info('ONNX export 완료: %s', output_path)
 

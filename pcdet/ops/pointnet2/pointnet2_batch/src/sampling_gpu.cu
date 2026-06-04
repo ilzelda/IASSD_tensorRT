@@ -2,7 +2,7 @@
 #include <stdlib.h>
 
 #include "cuda_utils.h"
-#include "sampling_gpu.h"
+#include "sampling_gpu_raw.h"
 
 
 __global__ void gather_points_kernel_fast(int b, int c, int n, int m, 

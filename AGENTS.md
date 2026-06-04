@@ -36,6 +36,8 @@
 - 새 스크립트는 특별한 이유가 없으면 `tools/` 아래에 추가한다.
 - 기존 IA-SSD/OpenPCDet 프로젝트 구조와 호환되도록 변경한다.
 - 학습된 weight 파일이나 dataset 파일은 수정하지 않는다.
+- KITTI config 기반 ONNX custom ops 변환 작업은 `docs/KITTI_ONNX_CUSTOM_OPS_PLAN.md`를 기준 계획으로 참고한다.
+- ONNX custom ops 변환 계획, 범위, 우선순위, 리스크, 검증 결과가 바뀌면 관련 코드 변경과 함께 `docs/KITTI_ONNX_CUSTOM_OPS_PLAN.md`를 갱신한다.
 - CUDA, PyTorch, ONNX, ONNX Runtime, TensorRT, ROS 버전은 재현성에 중요한 정보로 취급한다.
 - TensorRT engine 생성과 최종 benchmark는 현재 머신에서 수행한다.
 - benchmark 시 hardware, batch size, point count, precision mode, warmup 횟수, 측정 iteration 수, 전처리 및 후처리 포함 여부를 함께 기록한다.
