@@ -449,10 +449,13 @@ python3 tools/test_iassd_ort_group.py \
 - 최초로 큰 좌표 차이가 생기는 지점은 `TopK` 기반 sampling 이후의 `gather_points_2`이다.
 - `sa_ins_score_1`과 ONNX `sigmoid`는 max abs `1.2194737792015076e-05`, mean abs `5.297447280838696e-08`로 거의 일치하지만, `topk_indices_0`과 ONNX `_to_copy_1`은 달랐다.
 - 따라서 현재 큰 box 오차의 직접 원인은 custom op kernel의 큰 수치 오류보다는 PyTorch `torch.topk`와 ONNX Runtime `TopK`가 동점 또는 근접 score에서 다른 index를 선택하는 sampling divergence로 판단한다.
-- `pcdet/ops/pointnet2/pointnet2_batch/pointnet2_modules.py`의 `TopK` sampling 직전에 `1e-7 * index` tie-breaker를 score에서 빼는 deterministic index 우선순위를 추가했다.
+- `pcdet/ops/pointnet2/pointnet2_batch/pointnet2_modules.py`의 `TopK` sampling 직전에 index 기반 tie-breaker를 score에서 빼는 deterministic index 우선순위를 추가했다.
 - target image의 PyTorch `2.0.0a0+ec3941ad.nv23.02`에는 stage2 export에서 사용한 `torch.onnx._internal.exporter` API가 없어, target 안에서는 tie-breaker가 포함된 ONNX를 재export할 수 없었다.
 - 기존 ONNX graph에 사후로 `Sub(score, index_bias)`를 삽입하는 방식도 시험했지만, 첫 FPS/Gather output까지 깨지는 부작용이 확인되어 폐기했다.
-- 다음 검증은 PyTorch 2.5 계열 export 환경에서 stage2 ONNX를 재생성한 뒤 `tools/trace_iassd_ort_parity.py`로 `topk_indices_0/_to_copy_1`, `topk_indices_1/_to_copy_2`가 실제로 일치하는지 확인해야 한다.
+- PyTorch 2.5 계열 export 환경에서 tie-breaker가 포함된 stage2 ONNX를 재생성했고, target에서 `tools/trace_iassd_ort_parity.py`로 확인했다.
+- 새 ONNX에는 `sigmoid -> Sub -> TopK`, `sigmoid_1 -> Sub -> TopK` 경로가 반영되어 있으며, `TopK` 입력인 `topk_input_0/sub_4`는 max abs `3.0174851417541504e-06`, mean abs `3.858489350250238e-08`로 거의 일치했다.
+- 그러나 `eps=1e-7`에서는 이 수치 차이를 충분히 이기지 못해 `topk_indices_0/_to_copy_1`, `topk_indices_1/_to_copy_2`가 여전히 달랐다.
+- tie-breaker 계수를 `1e-5`로 올렸으므로, 다음 검증은 PyTorch 2.5 계열 export 환경에서 ONNX를 다시 생성한 뒤 같은 trace를 반복한다.
 
 검증 명령:
 
@@ -496,7 +499,7 @@ IASSD_DEBUG_RANGE_CHECK=1 python3 tools/trace_iassd_ort_parity.py \
 남은 작업:
 
 - shape와 runtime은 통과했지만 numerical parity 오차가 아직 크므로, 다음 단계에서 PyTorch `topk`와 ONNX Runtime `TopK`의 tie-breaking 차이를 줄이는 방식을 결정한다.
-- 1차 후보는 이미 core에 반영한 deterministic index tie-breaker를 포함해 ONNX를 재export하는 방식이다. 이 검증이 실패할 경우 `TopK` sampling도 `IASSD::TopKSampling` custom op로 분리하는 방식을 검토한다.
+- 1차 후보는 이미 core에 반영한 deterministic index tie-breaker를 포함해 ONNX를 재export하는 방식이다. `eps=1e-5` 재검증에서도 index가 맞지 않으면 `TopK` sampling도 `IASSD::TopKSampling` custom op로 분리하는 방식을 검토한다.
 - index CPU 왕복 복사는 정확도 검증 우선의 임시 안정화 경로다. benchmark 단계 전에는 ORT CUDA tensor memory 처리 방식에 맞춰 device index 경로를 최적화할지 결정한다.
 
 ### 6단계: TensorRT plugin 구현
@@ -582,6 +585,6 @@ IASSD_DEBUG_RANGE_CHECK=1 python3 tools/trace_iassd_ort_parity.py \
 
 ## 다음 액션
 
-다음 작업은 PyTorch 2.5 계열 export 환경에서 deterministic TopK tie-breaker가 포함된 KITTI IA-SSD ONNX graph를 재생성하고, target에서 `tools/trace_iassd_ort_parity.py`로 TopK index와 final raw output parity를 다시 확인하는 것이다.
+다음 작업은 PyTorch 2.5 계열 export 환경에서 `eps=1e-5` deterministic TopK tie-breaker가 포함된 KITTI IA-SSD ONNX graph를 재생성하고, target에서 `tools/trace_iassd_ort_parity.py`로 TopK index와 final raw output parity를 다시 확인하는 것이다.
 
 최종 ORT/TensorRT binary와 benchmark는 target machine에서 다시 빌드/검증한다.

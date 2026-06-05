@@ -234,7 +234,7 @@ class PointnetSAModuleMSG_WithSampling(_PointnetSAModuleBase):
         else:
             self.confidence_layers = None
 
-        self.topk_tiebreaker_eps = 1.0e-7
+        self.topk_tiebreaker_eps = 1.0e-5
 
 
     def forward(self, xyz: torch.Tensor, features: torch.Tensor = None, cls_features: torch.Tensor = None, new_xyz=None, ctr_xyz=None):

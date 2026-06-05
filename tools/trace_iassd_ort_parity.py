@@ -47,9 +47,11 @@ DEFAULT_ONNX_DEBUG_OUTPUTS = [
     'relu_14',
     'convolution_15',
     'sigmoid',
+    'sub_4',
     'relu_21',
     'convolution_24',
     'sigmoid_1',
+    'sub_7',
     'convolution_26',
     'add',
     'batch_cls_preds',
@@ -128,8 +130,9 @@ def collect_torch_trace(model, points):
     topk_records = []
 
     def traced_topk(*args, **kwargs):
+        score_input = args[0] if args else kwargs.get('input')
         values, indices = original_topk(*args, **kwargs)
-        topk_records.append((values.detach(), indices.detach()))
+        topk_records.append((score_input.detach(), values.detach(), indices.detach()))
         return values, indices
 
     try:
@@ -144,7 +147,8 @@ def collect_torch_trace(model, points):
         'batch_box_preds': tensor_to_numpy(batch_dict['batch_box_preds']),
     }
 
-    for idx, (values, indices) in enumerate(topk_records):
+    for idx, (score_input, values, indices) in enumerate(topk_records):
+        trace[f'topk_input_{idx}'] = tensor_to_numpy(score_input)
         trace[f'topk_values_{idx}'] = tensor_to_numpy(values)
         trace[f'topk_indices_{idx}'] = tensor_to_numpy(indices.int())
 
@@ -232,10 +236,12 @@ def compare_named_pairs(torch_trace, ort_trace):
         ('encoder_features_2', 'relu_14'),
         ('sa_ins_logits_1_bcn', 'convolution_15'),
         ('sa_ins_score_1', 'sigmoid'),
+        ('topk_input_0', 'sub_4'),
         ('topk_indices_0', '_to_copy_1'),
         ('encoder_xyz_3_bcn', 'gather_points_2'),
         ('sa_ins_logits_2_bcn', 'convolution_24'),
         ('sa_ins_score_2', 'sigmoid_1'),
+        ('topk_input_1', 'sub_7'),
         ('topk_indices_1', '_to_copy_2'),
         ('encoder_xyz_4_bcn', 'gather_points_3'),
         ('encoder_features_3', 'relu_14'),
