@@ -3,8 +3,11 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,6 +44,141 @@ bool IsDebugRangeCheckEnabled() {
     const char* value = std::getenv("IASSD_DEBUG_RANGE_CHECK");
     return value != nullptr && std::string(value) != "0";
 }
+
+bool IsProfileEnabled() {
+    const char* value = std::getenv("IASSD_ORT_PROFILE");
+    return value != nullptr && std::string(value) != "0";
+}
+
+cudaStream_t GetOrtCudaStream(const Ort::KernelContext& ctx) {
+    return reinterpret_cast<cudaStream_t>(ctx.GetGPUComputeStream());
+}
+
+struct ProfileCounter {
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> total_us{0};
+};
+
+struct ProfileStore {
+    ProfileCounter fps;
+    ProfileCounter fps_malloc;
+    ProfileCounter fps_temp_init;
+    ProfileCounter fps_kernel;
+    ProfileCounter fps_kernel_large;
+    ProfileCounter fps_kernel_small;
+    ProfileCounter fps_free;
+    ProfileCounter gather;
+    ProfileCounter ball_query;
+    ProfileCounter group;
+};
+
+ProfileStore& GetProfileStore() {
+    static ProfileStore store;
+    return store;
+}
+
+void AddProfileSample(ProfileCounter& counter, float elapsed_ms) {
+    counter.count.fetch_add(1, std::memory_order_relaxed);
+    counter.total_us.fetch_add(static_cast<uint64_t>(elapsed_ms * 1000.0f), std::memory_order_relaxed);
+}
+
+void AddProfileSampleUs(ProfileCounter& counter, uint64_t elapsed_us) {
+    counter.count.fetch_add(1, std::memory_order_relaxed);
+    counter.total_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+}
+
+struct CpuTimer {
+    explicit CpuTimer(ProfileCounter* counter)
+        : counter_(counter), start_(std::chrono::steady_clock::now()) {
+    }
+
+    ~CpuTimer() {
+        if (counter_ == nullptr) {
+            return;
+        }
+        const auto end = std::chrono::steady_clock::now();
+        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start_).count();
+        AddProfileSampleUs(*counter_, static_cast<uint64_t>(elapsed_us));
+    }
+
+    ProfileCounter* counter_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+struct CudaEventTimer {
+    CudaEventTimer(ProfileCounter* counter, cudaStream_t stream)
+        : counter_(counter), stream_(stream) {
+        if (counter_ == nullptr) {
+            return;
+        }
+        CheckCuda(cudaEventCreate(&start_), "profile start event 생성 실패");
+        CheckCuda(cudaEventCreate(&stop_), "profile stop event 생성 실패");
+        CheckCuda(cudaEventRecord(start_, stream_), "profile start event 기록 실패");
+    }
+
+    ~CudaEventTimer() {
+        if (counter_ == nullptr) {
+            return;
+        }
+        cudaError_t status = cudaEventRecord(stop_, stream_);
+        if (status == cudaSuccess) {
+            status = cudaEventSynchronize(stop_);
+        }
+        if (status == cudaSuccess) {
+            float elapsed_ms = 0.0f;
+            status = cudaEventElapsedTime(&elapsed_ms, start_, stop_);
+            if (status == cudaSuccess) {
+                AddProfileSample(*counter_, elapsed_ms);
+            }
+        }
+        cudaEventDestroy(start_);
+        cudaEventDestroy(stop_);
+    }
+
+    ProfileCounter* counter_;
+    cudaStream_t stream_;
+    cudaEvent_t start_{nullptr};
+    cudaEvent_t stop_{nullptr};
+};
+
+ProfileCounter* MaybeProfileCounter(ProfileCounter& counter) {
+    return IsProfileEnabled() ? &counter : nullptr;
+}
+
+void PrintProfileLine(const char* name, const ProfileCounter& counter) {
+    const uint64_t count = counter.count.load(std::memory_order_relaxed);
+    const uint64_t total_us = counter.total_us.load(std::memory_order_relaxed);
+    if (count == 0) {
+        return;
+    }
+    std::cerr
+        << "[IASSD_ORT_PROFILE] " << name
+        << " count=" << count
+        << " total_ms=" << static_cast<double>(total_us) / 1000.0
+        << " mean_ms=" << static_cast<double>(total_us) / static_cast<double>(count) / 1000.0
+        << std::endl;
+}
+
+struct ProfileReporter {
+    ~ProfileReporter() {
+        if (!IsProfileEnabled()) {
+            return;
+        }
+        const ProfileStore& store = GetProfileStore();
+        PrintProfileLine("FarthestPointSampling", store.fps);
+        PrintProfileLine("FarthestPointSampling.cudaMalloc", store.fps_malloc);
+        PrintProfileLine("FarthestPointSampling.tempInit", store.fps_temp_init);
+        PrintProfileLine("FarthestPointSampling.kernel", store.fps_kernel);
+        PrintProfileLine("FarthestPointSampling.kernel.large", store.fps_kernel_large);
+        PrintProfileLine("FarthestPointSampling.kernel.small", store.fps_kernel_small);
+        PrintProfileLine("FarthestPointSampling.cudaFree", store.fps_free);
+        PrintProfileLine("GatherPoints", store.gather);
+        PrintProfileLine("BallQuery", store.ball_query);
+        PrintProfileLine("GroupPoints", store.group);
+    }
+};
+
+ProfileReporter g_profile_reporter;
 
 void CheckIndexRangeOnHost(
     const int32_t* host_idx,
@@ -128,6 +266,8 @@ struct FarthestPointSamplingKernel {
 
     void Compute(OrtKernelContext* context) {
         Ort::KernelContext ctx(context);
+        const cudaStream_t stream = GetOrtCudaStream(ctx);
+        CudaEventTimer profile_timer(MaybeProfileCounter(GetProfileStore().fps), stream);
         const Ort::ConstValue xyz = ctx.GetInput(0);
         const Ort::TensorTypeAndShapeInfo xyz_info = xyz.GetTensorTypeAndShapeInfo();
         const std::vector<int64_t> xyz_shape = xyz_info.GetShape();
@@ -157,27 +297,51 @@ struct FarthestPointSamplingKernel {
 
         float* temp = nullptr;
         const size_t temp_bytes = static_cast<size_t>(batch_size) * static_cast<size_t>(num_points) * sizeof(float);
-        CheckCuda(cudaMalloc(reinterpret_cast<void**>(&temp), temp_bytes), "FPS temp cudaMalloc 실패");
+        {
+            CpuTimer malloc_timer(MaybeProfileCounter(GetProfileStore().fps_malloc));
+            CheckCuda(cudaMalloc(reinterpret_cast<void**>(&temp), temp_bytes), "FPS temp cudaMalloc 실패");
+        }
 
         try {
             // 기존 PyTorch op와 동일하게 temp를 1e10으로 초기화한다.
             std::vector<float> temp_init(static_cast<size_t>(batch_size) * static_cast<size_t>(num_points), 1.0e10f);
-            CheckCuda(cudaMemcpy(temp, temp_init.data(), temp_bytes, cudaMemcpyHostToDevice), "FPS temp 초기값 복사 실패");
-            farthest_point_sampling_kernel_launcher(
-                batch_size,
-                num_points,
-                npoint,
-                xyz_data,
-                temp,
-                reinterpret_cast<int*>(output_data)
-            );
+            {
+                CudaEventTimer init_timer(MaybeProfileCounter(GetProfileStore().fps_temp_init), stream);
+                CheckCuda(
+                    cudaMemcpyAsync(temp, temp_init.data(), temp_bytes, cudaMemcpyHostToDevice, stream),
+                    "FPS temp 초기값 복사 실패"
+                );
+            }
+            {
+                CudaEventTimer kernel_timer(MaybeProfileCounter(GetProfileStore().fps_kernel), stream);
+                CudaEventTimer kernel_shape_timer(
+                    MaybeProfileCounter(
+                        num_points >= 8192
+                            ? GetProfileStore().fps_kernel_large
+                            : GetProfileStore().fps_kernel_small
+                    ),
+                    stream
+                );
+                farthest_point_sampling_kernel_launcher(
+                    batch_size,
+                    num_points,
+                    npoint,
+                    xyz_data,
+                    temp,
+                    reinterpret_cast<int*>(output_data),
+                    stream
+                );
+            }
             CheckCuda(cudaDeviceSynchronize(), "FPS kernel 동기화 실패");
         } catch (...) {
             cudaFree(temp);
             throw;
         }
 
-        CheckCuda(cudaFree(temp), "FPS temp cudaFree 실패");
+        {
+            CpuTimer free_timer(MaybeProfileCounter(GetProfileStore().fps_free));
+            CheckCuda(cudaFree(temp), "FPS temp cudaFree 실패");
+        }
     }
 
     int64_t npoint_;
@@ -227,6 +391,8 @@ struct GatherPointsKernel {
 
     void Compute(OrtKernelContext* context) {
         Ort::KernelContext ctx(context);
+        const cudaStream_t stream = GetOrtCudaStream(ctx);
+        CudaEventTimer profile_timer(MaybeProfileCounter(GetProfileStore().gather), stream);
         const Ort::ConstValue features = ctx.GetInput(0);
         const Ort::ConstValue idx = ctx.GetInput(1);
         const Ort::TensorTypeAndShapeInfo features_info = features.GetTensorTypeAndShapeInfo();
@@ -297,7 +463,8 @@ struct GatherPointsKernel {
                 npoint,
                 features_data,
                 reinterpret_cast<const int*>(device_idx),
-                output_data
+                output_data,
+                stream
             );
             CheckCuda(cudaDeviceSynchronize(), "GatherPoints kernel 동기화 실패");
         } catch (...) {
@@ -373,6 +540,8 @@ struct BallQueryKernel {
 
     void Compute(OrtKernelContext* context) {
         Ort::KernelContext ctx(context);
+        const cudaStream_t stream = GetOrtCudaStream(ctx);
+        CudaEventTimer profile_timer(MaybeProfileCounter(GetProfileStore().ball_query), stream);
         const Ort::ConstValue xyz = ctx.GetInput(0);
         const Ort::ConstValue new_xyz = ctx.GetInput(1);
         const Ort::TensorTypeAndShapeInfo xyz_info = xyz.GetTensorTypeAndShapeInfo();
@@ -413,7 +582,7 @@ struct BallQueryKernel {
 
         const size_t output_bytes =
             static_cast<size_t>(batch_size) * static_cast<size_t>(npoint) * static_cast<size_t>(nsample) * sizeof(int32_t);
-        CheckCuda(cudaMemset(output_data, 0x00, output_bytes), "BallQuery output cudaMemset 실패");
+        CheckCuda(cudaMemsetAsync(output_data, 0x00, output_bytes, stream), "BallQuery output cudaMemset 실패");
 
         ball_query_kernel_launcher_fast(
             batch_size,
@@ -423,7 +592,8 @@ struct BallQueryKernel {
             nsample,
             new_xyz_data,
             xyz_data,
-            reinterpret_cast<int*>(output_data)
+            reinterpret_cast<int*>(output_data),
+            stream
         );
         CheckCuda(cudaDeviceSynchronize(), "BallQuery kernel 동기화 실패");
     }
@@ -476,6 +646,8 @@ struct GroupPointsKernel {
 
     void Compute(OrtKernelContext* context) {
         Ort::KernelContext ctx(context);
+        const cudaStream_t stream = GetOrtCudaStream(ctx);
+        CudaEventTimer profile_timer(MaybeProfileCounter(GetProfileStore().group), stream);
         const Ort::ConstValue features = ctx.GetInput(0);
         const Ort::ConstValue idx = ctx.GetInput(1);
         const Ort::TensorTypeAndShapeInfo features_info = features.GetTensorTypeAndShapeInfo();
@@ -550,7 +722,8 @@ struct GroupPointsKernel {
                 nsample,
                 features_data,
                 reinterpret_cast<const int*>(device_idx),
-                output_data
+                output_data,
+                stream
             );
             CheckCuda(cudaDeviceSynchronize(), "GroupPoints kernel 동기화 실패");
         } catch (...) {

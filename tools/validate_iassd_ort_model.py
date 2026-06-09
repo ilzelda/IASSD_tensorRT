@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import glob
 import json
 import sys
@@ -137,11 +138,21 @@ def parse_args():
     parser.add_argument('--ckpt', type=str, default='tools/IA-SSD.pth')
     parser.add_argument('--onnx_file', type=str, required=True, help='검증할 IA-SSD ONNX 파일')
     parser.add_argument('--ort_op_library', type=str, required=True, help='libiassd_ort_ops.so 경로')
+    parser.add_argument('--trt_plugin_library', type=str, default=None, help='TensorRT plugin library 경로')
     parser.add_argument('--sample_data_path', type=str, default=None, help='샘플 포인트클라우드 파일 또는 디렉터리 경로')
     parser.add_argument('--sample_ext', type=str, default='.bin', help='샘플 포인트클라우드 확장자')
     parser.add_argument('--num_points', type=int, default=16384, help='synthetic 입력 생성 시 포인트 수')
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda'], help='현재 검증은 CUDA 경로만 지원')
     parser.add_argument('--providers', type=str, default='CUDAExecutionProvider', help='쉼표로 구분한 ORT provider 목록')
+    parser.add_argument('--provider_options', type=str, default=None, help='ORT provider option JSON 문자열')
+    parser.add_argument(
+        '--graph_optimization_level',
+        type=str,
+        default='ORT_ENABLE_ALL',
+        choices=['ORT_DISABLE_ALL', 'ORT_ENABLE_BASIC', 'ORT_ENABLE_EXTENDED', 'ORT_ENABLE_ALL'],
+        help='ORT graph optimization level',
+    )
+    parser.add_argument('--session_only', action='store_true', help='PyTorch 비교 없이 ORT session 생성만 확인')
     parser.add_argument('--report_file', type=str, default=None, help='shape/error report JSON 저장 경로')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER, help='추가 config override')
     return parser.parse_args()
@@ -189,11 +200,53 @@ def compare_outputs(torch_outputs, ort_outputs):
     return report
 
 
-def run_ort(onnx_file, ort_op_library, points_np, providers):
+def load_trt_plugin_library(trt_plugin_library):
+    if trt_plugin_library is None:
+        return
+    plugin_path = Path(trt_plugin_library).resolve()
+    if not plugin_path.exists():
+        raise FileNotFoundError(f'TensorRT plugin library가 없습니다: {plugin_path}')
+    ctypes.CDLL(str(plugin_path), mode=ctypes.RTLD_GLOBAL)
+
+
+def parse_provider_options(provider_options):
+    if provider_options is None:
+        return None
+    parsed = json.loads(provider_options)
+    if not isinstance(parsed, dict):
+        raise ValueError('--provider_options는 JSON object여야 합니다.')
+    return parsed
+
+
+def make_provider_config(providers, provider_options):
+    if provider_options is None:
+        return providers
+
+    provider_names = set(providers)
+    has_provider_keys = any(key in provider_names for key in provider_options)
+    if has_provider_keys:
+        return [
+            (provider, provider_options.get(provider, {}))
+            for provider in providers
+        ]
+
+    # provider 이름으로 감싸지 않은 option object는 첫 provider에만 적용한다.
+    configured = []
+    for index, provider in enumerate(providers):
+        configured.append((provider, provider_options if index == 0 else {}))
+    return configured
+
+
+def create_ort_session(onnx_file, ort_op_library, providers, provider_options=None, graph_optimization_level='ORT_ENABLE_ALL'):
     options = ort.SessionOptions()
     options.register_custom_ops_library(str(ort_op_library))
-    session = ort.InferenceSession(str(onnx_file), sess_options=options, providers=providers)
+    options.graph_optimization_level = getattr(ort.GraphOptimizationLevel, graph_optimization_level)
+    provider_config = make_provider_config(providers, provider_options)
+    return ort.InferenceSession(str(onnx_file), sess_options=options, providers=provider_config)
 
+
+def run_ort(onnx_file, ort_op_library, points_np, providers, provider_options=None, graph_optimization_level='ORT_ENABLE_ALL'):
+    session = create_ort_session(onnx_file, ort_op_library, providers, provider_options, graph_optimization_level)
     input_name = session.get_inputs()[0].name
     ort_raw_outputs = session.run(None, {input_name: points_np})
     output_names = [output.name for output in session.get_outputs()]
@@ -222,6 +275,27 @@ def main():
         raise FileNotFoundError(f'checkpoint 파일이 없습니다: {ckpt_file}')
     if args.device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA를 사용할 수 없습니다.')
+    load_trt_plugin_library(args.trt_plugin_library)
+    providers = [provider.strip() for provider in args.providers.split(',') if provider.strip()]
+    provider_options = parse_provider_options(args.provider_options)
+
+    if args.session_only:
+        session = create_ort_session(onnx_file, ort_op_library, providers, provider_options, args.graph_optimization_level)
+        report = {
+            'onnx_file': str(onnx_file),
+            'ort_op_library': str(ort_op_library),
+            'trt_plugin_library': args.trt_plugin_library,
+            'providers_requested': providers,
+            'provider_options': provider_options,
+            'graph_optimization_level': args.graph_optimization_level,
+            'providers_active': session.get_providers(),
+        }
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        if args.report_file is not None:
+            report_path = Path(args.report_file)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')
+        return
 
     old_cwd = Path.cwd()
     try:
@@ -260,8 +334,14 @@ def main():
         'batch_cls_preds': tensor_to_numpy(batch_cls_preds),
         'batch_box_preds': tensor_to_numpy(batch_box_preds),
     }
-    providers = [provider.strip() for provider in args.providers.split(',') if provider.strip()]
-    ort_outputs = run_ort(onnx_file, ort_op_library, tensor_to_numpy(points), providers)
+    ort_outputs = run_ort(
+        onnx_file,
+        ort_op_library,
+        tensor_to_numpy(points),
+        providers,
+        provider_options,
+        args.graph_optimization_level,
+    )
 
     report = {
         'cfg_file': str(cfg_file),
@@ -269,6 +349,8 @@ def main():
         'onnx_file': str(onnx_file),
         'ort_op_library': str(ort_op_library),
         'providers_requested': providers,
+        'provider_options': provider_options,
+        'graph_optimization_level': args.graph_optimization_level,
         'num_points': args.num_points,
         'input_points': {
             'shape': list(points.shape),

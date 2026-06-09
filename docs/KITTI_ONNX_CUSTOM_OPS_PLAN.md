@@ -453,9 +453,13 @@ python3 tools/test_iassd_ort_group.py \
 - target image의 PyTorch `2.0.0a0+ec3941ad.nv23.02`에는 stage2 export에서 사용한 `torch.onnx._internal.exporter` API가 없어, target 안에서는 tie-breaker가 포함된 ONNX를 재export할 수 없었다.
 - 기존 ONNX graph에 사후로 `Sub(score, index_bias)`를 삽입하는 방식도 시험했지만, 첫 FPS/Gather output까지 깨지는 부작용이 확인되어 폐기했다.
 - PyTorch 2.5 계열 export 환경에서 tie-breaker가 포함된 stage2 ONNX를 재생성했고, target에서 `tools/trace_iassd_ort_parity.py`로 확인했다.
-- 새 ONNX에는 `sigmoid -> Sub -> TopK`, `sigmoid_1 -> Sub -> TopK` 경로가 반영되어 있으며, `TopK` 입력인 `topk_input_0/sub_4`는 max abs `3.0174851417541504e-06`, mean abs `3.858489350250238e-08`로 거의 일치했다.
-- 그러나 `eps=1e-7`에서는 이 수치 차이를 충분히 이기지 못해 `topk_indices_0/_to_copy_1`, `topk_indices_1/_to_copy_2`가 여전히 달랐다.
-- tie-breaker 계수를 `1e-5`로 올렸으므로, 다음 검증은 PyTorch 2.5 계열 export 환경에서 ONNX를 다시 생성한 뒤 같은 trace를 반복한다.
+- `eps=1e-7`에서는 수치 차이를 충분히 이기지 못해 `topk_indices_0/_to_copy_1`, `topk_indices_1/_to_copy_2`가 여전히 달랐다.
+- tie-breaker 계수를 `1e-5`로 올린 뒤 stage2 ONNX를 다시 생성했다.
+- 새 ONNX에는 `sigmoid -> Sub -> TopK`, `sigmoid_1 -> Sub -> TopK` 경로가 반영되어 있다.
+- `eps=1e-5` 재export ONNX의 trace 결과, `topk_indices_0/_to_copy_1`, `topk_indices_1/_to_copy_2`는 exact match가 됐다.
+- 일반 ONNX graph에서는 trace graph보다 final output 오차가 크게 나오는 현상이 있었다. 원인은 ORT CUDA EP 표준 op가 ORT compute stream에서 실행되는 반면, custom CUDA launcher가 기본 stream에 kernel을 launch해 input readiness 순서가 보장되지 않는 race로 판단했다.
+- `sampling_gpu_raw.h`, `ball_query_gpu_raw.h`, `group_points_gpu_raw.h`와 각 CUDA launcher에 `cudaStream_t` 인자를 추가하고, ORT custom op에서 `Ort::KernelContext::GetGPUComputeStream()`을 전달하도록 수정했다.
+- PyTorch extension wrapper는 기본 stream 인자를 유지해 기존 호출 형태와 호환된다.
 
 검증 명령:
 
@@ -495,12 +499,29 @@ IASSD_DEBUG_RANGE_CHECK=1 python3 tools/trace_iassd_ort_parity.py \
 - `batch_cls_preds` 오차: max abs `2.86238956451416`, mean abs `0.03077808301895857`
 - `batch_box_preds`: PyTorch `(256, 7)`, ORT `(256, 7)`, shape 일치
 - `batch_box_preds` 오차: max abs `50.89475631713867`, mean abs `0.12930782358307624`
+- 결과 해석: shape와 runtime은 통과했지만 TopK index divergence 때문에 numerical parity 오차가 컸다.
+
+재검증 결과:
+
+- 실행일: 2026-06-05
+- Docker image: `ia-ssd-target:latest`
+- ONNX: `onnx_exports/stage2/ia_ssd_kitti_with_iassd_opset.onnx`
+- custom op library: `/tmp/iassd_ort_ops_build/libiassd_ort_ops.so`
+- 입력 `points`: `(16384, 5)`, `torch.float32`, `cuda:0`
+- 단위 테스트: `IASSD::FarthestPointSampling`, `IASSD::GatherPoints`, `IASSD::BallQuery`, `IASSD::GroupPoints` 모두 통과
+- trace: `topk_indices_0/_to_copy_1`, `topk_indices_1/_to_copy_2` exact match
+- trace final `batch_cls_preds` 오차: max abs `0.0108184814453125`, mean abs `0.000836263100306193`
+- trace final `batch_box_preds` 오차: max abs `0.0018192529678344727`, mean abs `8.585689855473382e-05`
+- stream 수정 후 일반 graph final `batch_cls_preds` 오차: max abs `0.00971221923828125`, mean abs `0.0008820537477731705`
+- stream 수정 후 일반 graph final `batch_box_preds` 오차: max abs `0.0028738975524902344`, mean abs `9.923223218980379e-05`
+- report: `onnx_exports/stage5/kitti_ort_cuda_trace_report_after_eps1e5.json`
+- report: `onnx_exports/stage5/kitti_ort_cuda_parity_report_stream_fixed.json`
 
 남은 작업:
 
-- shape와 runtime은 통과했지만 numerical parity 오차가 아직 크므로, 다음 단계에서 PyTorch `topk`와 ONNX Runtime `TopK`의 tie-breaking 차이를 줄이는 방식을 결정한다.
-- 1차 후보는 이미 core에 반영한 deterministic index tie-breaker를 포함해 ONNX를 재export하는 방식이다. `eps=1e-5` 재검증에서도 index가 맞지 않으면 `TopK` sampling도 `IASSD::TopKSampling` custom op로 분리하는 방식을 검토한다.
+- CUDA EP raw output parity는 다음 단계로 넘어갈 수 있는 수준으로 개선됐다.
 - index CPU 왕복 복사는 정확도 검증 우선의 임시 안정화 경로다. benchmark 단계 전에는 ORT CUDA tensor memory 처리 방식에 맞춰 device index 경로를 최적화할지 결정한다.
+- custom op 내부의 `cudaDeviceSynchronize()`는 정확도 검증 중 안정성을 위해 남아 있다. benchmark 전에는 ORT stream dependency를 유지하면서 op별 불필요한 device-wide sync를 줄이는 최적화를 검토한다.
 
 ### 6단계: TensorRT plugin 구현
 
@@ -517,6 +538,21 @@ IASSD_DEBUG_RANGE_CHECK=1 python3 tools/trace_iassd_ort_parity.py \
 - ORT CUDA path와 TensorRT path output 비교
 - FP16은 FP32 parity가 안정화된 뒤 진행
 
+진행 기록:
+
+- 상태: `IASSD::FarthestPointSampling` TensorRT plugin 1차 구현 완료
+- 진행일: 2026-06-05
+- target image의 ONNX Runtime GPU wheel에서 작은 표준 ONNX `MatMul` 모델은 `TensorrtExecutionProvider,CUDAExecutionProvider`로 session 생성과 실행이 통과했다.
+- `IASSD::FarthestPointSampling` 하나만 포함한 작은 custom op ONNX 모델도 `TensorrtExecutionProvider,CUDAExecutionProvider`로 session 생성과 실행이 통과했다. 이 경우 TensorRT EP는 실행할 subgraph가 없다고 판단하고 CUDA custom op fallback으로 실행한다.
+- 따라서 target의 TensorRT EP 설치 자체와 custom op fallback 조합은 최소 모델에서는 동작한다.
+- 실제 IA-SSD ONNX는 TensorRT EP session 생성 단계에서 `graph_build.Resolve().IsOK() was false`로 실패한다.
+- 실패 원인은 TensorRT plugin 부재 하나로 단정하기 어렵고, 현재 export graph에 남아 있는 ONNXScript local function과 scalar helper subgraph가 TensorRT EP partition/resolve 단계와 충돌하는 것으로 판단한다.
+- `tools/iassd_trt_plugins/`를 추가해 TensorRT plugin shared library `libiassd_trt_plugins.so`를 빌드할 수 있게 했다.
+- `IASSD::FarthestPointSampling`에 대응하는 TensorRT `IPluginV2DynamicExt` plugin과 creator를 구현했다.
+- plugin enqueue는 기존 raw CUDA launcher `farthest_point_sampling_kernel_launcher(...)`를 재사용하고, TensorRT workspace를 FPS temp buffer로 사용한다.
+- `tools/test_iassd_trt_fps_plugin.py`를 추가했다. 이 테스트는 작은 `IASSD::FarthestPointSampling` ONNX를 생성하고, TensorRT ONNX parser가 plugin으로 engine을 빌드한 뒤 TensorRT 실행 결과를 PyTorch FPS index와 비교한다.
+- 검증 결과: `batch_size=1`, `num_points=512`, `npoint=64`에서 TensorRT parser가 `PLUGIN_V2: node_of_idx`로 plugin layer를 생성했고, TensorRT 실행 output index가 PyTorch FPS output index와 정확히 일치했다.
+
 ### 7단계: ORT TensorRT EP 통합
 
 산출물:
@@ -530,6 +566,40 @@ IASSD_DEBUG_RANGE_CHECK=1 python3 tools/trace_iassd_ort_parity.py \
 - TensorRT EP session 생성 성공
 - unsupported op가 plugin으로 매핑되는지 확인
 - PyTorch, ORT CUDA, ORT TensorRT latency 비교
+
+진행 기록:
+
+- 상태: blocker 분석 중
+- 진행일: 2026-06-05
+- 원본 stage2 ONNX의 top-level node domain은 `ai.onnx` 658개, `pkg.onnxscript.torch_lib` 80개, `this` 31개였다.
+- `this::onnx_farthest_point_sampling`, `this::onnx_gather_points`, `this::onnx_ball_query`, `this::onnx_group_points`는 실제 `IASSD::*` custom op를 한 번 더 감싼 ONNXScript local function wrapper다.
+- `tools/flatten_onnx_functions.py`를 추가해 ONNX local function call을 내부 node로 평탄화할 수 있게 했다.
+- `--domains this`로 IA-SSD custom op wrapper만 평탄화한 `ia_ssd_kitti_with_iassd_opset_iassd_flat.onnx`는 CUDA EP parity를 유지했다.
+- `ia_ssd_kitti_with_iassd_opset_iassd_flat.onnx` CUDA EP final `batch_cls_preds` 오차: max abs `0.008821487426757812`, mean abs `0.0009585299218694369`
+- `ia_ssd_kitti_with_iassd_opset_iassd_flat.onnx` CUDA EP final `batch_box_preds` 오차: max abs `0.0035059452056884766`, mean abs `0.00010579687659628689`
+- 그러나 `TensorrtExecutionProvider,CUDAExecutionProvider` session 생성은 여전히 `graph_build.Resolve().IsOK() was false`로 실패했다.
+- 전체 local function flatten도 시험했지만 `aten_squeeze_dim`의 제어흐름 helper를 펼치며 CUDA 실행 중 `Concat` shape mismatch가 발생해 폐기했다.
+- `aten_squeeze_dim`, `Rank`, `IsScalar`만 남기고 나머지 local function을 평탄화한 모델은 TensorRT EP가 실제 TensorRT parser까지 진행했지만, 여전히 `graph_build.Resolve().IsOK() was false`로 실패했다.
+- `trt_dump_subgraphs=True`로 얻은 실패 subgraph는 scalar `Identity` 하나짜리 graph였다: `node_aten_max_683__result -> node_aten_max_683__result_4`, shape `[]`.
+- top-level `Identity` node를 제거한 모델에서도 같은 scalar `Identity` subgraph가 TensorRT EP 내부 partition 과정에서 다시 생성되어 실패했다.
+- `aten_max`, `aten_min`을 function으로 남겨도 TensorRT EP session 생성은 같은 resolve 오류로 실패했다.
+- `IASSD::FarthestPointSampling` TensorRT plugin library를 `ctypes.CDLL(..., RTLD_GLOBAL)`로 로드하고, ORT custom op library도 함께 등록한 상태에서 `ia_ssd_kitti_with_iassd_opset_iassd_flat.onnx`를 `TensorrtExecutionProvider,CUDAExecutionProvider`로 다시 검증했다.
+- 결과: TensorRT FPS plugin이 있어도 전체 IA-SSD ORT TensorRT EP session 생성은 여전히 `graph_build.Resolve().IsOK() was false`로 실패했다.
+- 따라서 현재 blocker는 FPS plugin 부재가 아니라 ORT TensorRT EP의 graph partition/resolve 단계에 남아 있다.
+- `tools/validate_iassd_ort_model.py`에 `--session_only`, `--provider_options`, `--graph_optimization_level` 옵션을 추가해 PyTorch 비교 없이 ORT/TensorRT session 생성만 빠르게 재현할 수 있게 했다.
+- `tools/flatten_onnx_functions.py`에 `--remove_identity_outputs`를 추가해 graph output에 연결된 `Identity`까지 제거할 수 있게 했다.
+- `ia_ssd_kitti_with_iassd_opset_iassd_flat_noid_outputs.onnx`를 생성해 top-level `Identity`가 0개임을 확인했지만, `TensorrtExecutionProvider,CUDAExecutionProvider` session 생성은 여전히 첫 subgraph `graph_build.Resolve().IsOK() was false`로 실패했다.
+- `ia_ssd_kitti_with_iassd_opset_except_squeeze_noid.onnx`와 `ia_ssd_kitti_with_iassd_opset_trt_probe.onnx`는 TensorRT parser 단계까지 도달하지만, recursive partition 중 동일한 scalar `Identity` subgraph에서 다시 실패했다.
+- 최신 `trt_dump_subgraphs=True` dump도 `Identity(node_aten_max_683__result -> node_aten_max_683__result_4)` 하나짜리 scalar graph였다. 원본 top-level graph에는 이 `Identity`가 없고 `node_aten_max_683__result`는 `ReduceMax` 출력이므로, 이 `Identity`는 ORT TensorRT EP partition 과정에서 생성된 alias subgraph로 판단한다.
+- `--graph_optimization_level ORT_DISABLE_ALL`로 graph optimization을 꺼도 같은 scalar `Identity` partition 실패가 유지됐다.
+- `trt_max_partition_iterations=0`은 ORT가 허용하지 않고 warning 후 기본값 `1000`으로 되돌려, provider option만으로 recursive partition을 끄는 우회는 사용할 수 없었다.
+
+현재 판단:
+
+- ORT TensorRT EP 1.16에서 이 export graph를 그대로 TensorRT/CUDA fallback으로 실행하려면, 단순히 IA-SSD custom op wrapper를 평탄화하는 것만으로는 부족하다.
+- 다음 후보는 export 단계에서 ONNXScript torch helper가 남지 않도록 graph를 더 단순한 표준 ONNX op로 생성하거나, ORT TensorRT EP 대신 TensorRT network/plugin을 직접 구성하는 경로다.
+- TensorRT plugin 자체는 작은 ONNX에서 동작하므로, 이후 BallQuery/Gather/GroupPoints plugin을 추가하는 작업과 전체 graph resolve blocker 제거 작업은 분리해서 진행한다.
+- 단기 benchmark는 이미 검증된 ORT CUDA EP custom op 경로로 먼저 진행하고, TensorRT 가속은 별도 branch 작업으로 분리하는 것이 안전하다.
 
 ### 8단계: benchmark 정리
 
@@ -554,6 +624,86 @@ IASSD_DEBUG_RANGE_CHECK=1 python3 tools/trace_iassd_ort_parity.py \
 - post-processing 포함 여부
 - pure model latency
 - custom op별 latency 가능 여부
+
+진행 기록:
+
+- 상태: ORT CUDA EP raw benchmark 1차 완료
+- 진행일: 2026-06-05
+- `tools/benchmark_iassd_ort_cuda.py`를 추가해 같은 입력에서 PyTorch raw forward와 ORT CUDA EP `session.run` latency를 비교할 수 있게 했다.
+- 현재 benchmark는 전처리와 후처리를 제외하고, `batch_cls_preds`, `batch_box_preds` raw output 생성까지를 측정한다.
+- ORT 측정은 Python `onnxruntime.InferenceSession.run`에 numpy 입력을 넣고 numpy 출력을 받는 경로라 H2D/D2H 및 Python call overhead가 포함된다.
+- `tools/benchmark_iassd_ort_cuda.py`에 ORT CUDA IO binding 측정을 추가해 CUDA input 재사용 및 CUDA output 유지 경로를 별도로 측정할 수 있게 했다.
+- custom op 내부에는 정확도 검증 안정성을 위해 `cudaDeviceSynchronize()`가 아직 남아 있고, `GatherPoints`/`GroupPoints` index 입력은 CPU 왕복 복사를 사용한다.
+
+측정 명령:
+
+```bash
+cd /workspace/IA-SSD
+IASSD_DEBUG_RANGE_CHECK=1 python3 tools/benchmark_iassd_ort_cuda.py \
+  --cfg_file tools/cfgs/kitti_models/IA-SSD.yaml \
+  --ckpt tools/IA-SSD.pth \
+  --onnx_file onnx_exports/stage2/ia_ssd_kitti_with_iassd_opset.onnx \
+  --ort_op_library /tmp/iassd_ort_ops_build/libiassd_ort_ops.so \
+  --num_points 16384 \
+  --warmup 20 \
+  --iterations 100 \
+  --providers CUDAExecutionProvider \
+  --report_file onnx_exports/stage5/kitti_ort_cuda_benchmark_raw_100.json
+```
+
+측정 결과:
+
+- Hardware: Jetson Orin, `aarch64`, Linux `5.10.120-tegra`
+- PyTorch: `2.0.0a0+ec3941ad.nv23.02`, CUDA `11.4`
+- ONNX Runtime: `1.16.0`
+- 입력 `points`: `(16384, 5)`, `torch.float32`, `cuda:0`
+- warmup: 20
+- iterations: 100
+- PyTorch raw forward: mean `47.96612024307251 ms`, median `47.850911505520344 ms`, p95 `48.69451932609081 ms`, FPS(mean) `20.848048475307415`
+- ORT CUDA `session.run`: mean `63.68923461064696 ms`, median `63.65747284144163 ms`, p95 `64.33191150426865 ms`, FPS(mean) `15.70124065885429`
+- report: `onnx_exports/stage5/kitti_ort_cuda_benchmark_raw_100.json`
+
+추가 측정 및 최적화 실험:
+
+- `ia_ssd_kitti_with_iassd_opset_iassd_flat.onnx`는 2026-06-05 재검증에서 CUDA EP parity를 유지했다.
+  - `batch_cls_preds`: max abs `0.012142181396484375`, mean abs `0.0008731304357449213`
+  - `batch_box_preds`: max abs `0.005153656005859375`, mean abs `0.0001013898872770369`
+  - report: `onnx_exports/stage5/kitti_ort_cuda_parity_report_iassd_flat_recheck.json`
+- 같은 flat graph 기준 100회 benchmark 결과:
+  - ORT CUDA `session.run`: mean `63.75184828415513 ms`, median `63.742563128471375 ms`, p95 `64.30155970156193 ms`, FPS(mean) `15.685819735653684`
+  - ORT CUDA IO binding run: mean `65.97143437713385 ms`, median `66.01518765091896 ms`, p95 `66.77856110036373 ms`, FPS(mean) `15.158075755688085`
+  - IO binding output `copy_outputs_to_cpu`: mean `0.45840539038181305 ms`
+  - report: `onnx_exports/stage5/kitti_ort_cuda_benchmark_iassd_flat_100.json`
+- 결론: 현재 병목은 numpy 출력 복사나 Python `session.run`의 단순 D2H 비용이 아니라 graph/custom op 실행 내부에 있다. IO binding은 이 모델/ORT 1.16 경로에서 속도 개선이 아니므로 기본 benchmark는 `session.run` 결과를 기준으로 유지한다.
+- custom op 내부 `cudaDeviceSynchronize()`를 `cudaStreamSynchronize()` 또는 무동기화 경로로 줄이는 실험은 full model parity가 크게 깨져 보류했다. ORT 1.16 custom op와 CUDA EP 표준 노드 사이의 stream dependency를 직접 보장할 수 있을 때 다시 검토한다.
+- `GatherPoints`/`GroupPoints` index 입력을 device tensor로 직접 받는 실험은 단위 테스트에서는 통과했지만, full IA-SSD graph parity가 크게 깨져 보류했다. 실제 graph에서는 해당 index 입력의 memory placement가 custom op 기대와 일치한다고 가정하면 안 된다.
+- `tools/iassd_ort_ops/farthest_point_sampling_op.cc`에 `IASSD_ORT_PROFILE=1` custom op별 CUDA event 누적 계측을 추가했다. 이 옵션은 custom op 라이브러리 언로드/프로세스 종료 시 stderr에 op별 호출 수, 총 시간, 평균 시간을 출력한다.
+- flat graph, warmup 2, iterations 3의 짧은 계측 결과:
+  - `FarthestPointSampling`: count `10`, total `161.548 ms`, mean `16.1548 ms`
+  - `GatherPoints`: count `25`, total `2.608 ms`, mean `0.10432 ms`
+  - `BallQuery`: count `40`, total `59.448 ms`, mean `1.4862 ms`
+  - `GroupPoints`: count `80`, total `43.568 ms`, mean `0.5446 ms`
+  - 같은 실행의 ORT CUDA `session.run`: mean `64.80249700446923 ms`
+- 계측 해석: IA-SSD 1회 추론 기준 custom op 대략 비용은 FPS 2회 약 `32 ms`, BallQuery 8회 약 `12 ms`, GroupPoints 16회 약 `9 ms`, GatherPoints 5회 약 `0.5 ms` 수준이다. 따라서 다음 속도 최적화의 1순위는 `FarthestPointSampling`이다.
+- FPS 내부 세분화 계측을 추가했다. flat graph, warmup 2, iterations 3의 짧은 계측 결과:
+  - `FarthestPointSampling`: count `10`, total `173.545 ms`, mean `17.3545 ms`
+  - `FarthestPointSampling.cudaMalloc`: count `10`, total `0.104 ms`, mean `0.0104 ms`
+  - `FarthestPointSampling.tempInit`: count `10`, total `0.333 ms`, mean `0.0333 ms`
+  - `FarthestPointSampling.kernel`: count `10`, total `172.083 ms`, mean `17.2083 ms`
+  - `FarthestPointSampling.kernel.large`: count `5`, total `159.224 ms`, mean `31.8448 ms`
+  - `FarthestPointSampling.kernel.small`: count `5`, total `12.719 ms`, mean `2.5438 ms`
+  - `FarthestPointSampling.cudaFree`: count `10`, total `0.073 ms`, mean `0.0073 ms`
+- 계측 해석: FPS 병목은 temp buffer 할당/초기화가 아니라 kernel 본체다. 특히 KITTI config의 첫 D-FPS 단계 `16384 -> 4096`이 평균 `31.8448 ms`로 지배적이고, 두 번째 D-FPS 단계 `4096 -> 1024`는 평균 `2.5438 ms` 수준이다.
+
+다음 최적화 후보:
+
+- `ia_ssd_kitti_with_iassd_opset_iassd_flat.onnx`를 benchmark 기준 graph로 우선 사용한다.
+- 첫 D-FPS `16384 -> 4096`의 exact FPS 비용을 줄이는 방법을 검토한다. 단순 메모리 관리 최적화로는 효과가 거의 없으므로 kernel 알고리즘/구현 자체를 다뤄야 한다.
+- 정확도 유지가 최우선이면 FPS kernel의 reduction 구현, block size, warp-level reduction 최적화를 검토한다.
+- 속도 우선 모드가 허용되면 첫 D-FPS에 대해 approximate FPS, sector/grid 기반 pre-sampling, 또는 `NPOINT_LIST[0]` 축소를 별도 옵션으로 실험하고 PyTorch 기준 output/parity 및 최종 detection 품질 영향을 측정한다.
+- `cudaDeviceSynchronize()` 제거는 단순 stream sync가 아니라 ORT CUDA EP와 명시 이벤트 또는 allocator/stream contract를 맞춘 뒤 재시도한다.
+- `GatherPoints`/`GroupPoints` device index 경로는 ORT node assignment와 input memory info를 확인할 수 있는 진단 로그를 먼저 추가한 뒤 재시도한다.
+- 정확도 리포트와 benchmark 리포트를 같은 실행에서 묶는 통합 benchmark를 작성한다.
 
 ## 개발 우선순위
 
@@ -585,6 +735,6 @@ IASSD_DEBUG_RANGE_CHECK=1 python3 tools/trace_iassd_ort_parity.py \
 
 ## 다음 액션
 
-다음 작업은 PyTorch 2.5 계열 export 환경에서 `eps=1e-5` deterministic TopK tie-breaker가 포함된 KITTI IA-SSD ONNX graph를 재생성하고, target에서 `tools/trace_iassd_ort_parity.py`로 TopK index와 final raw output parity를 다시 확인하는 것이다.
+다음 작업은 CUDA EP raw output parity가 통과한 ONNX/custom op 경로를 기준으로 TensorRT EP 로딩 가능성을 확인하고, 필요한 경우 TensorRT plugin 구현 범위를 확정하는 것이다.
 
 최종 ORT/TensorRT binary와 benchmark는 target machine에서 다시 빌드/검증한다.
