@@ -1,5 +1,6 @@
 **__pycache__**
 **build**
+!tools/build_iassd_trt_engine.py
 **egg-info**
 **dist**
 output/

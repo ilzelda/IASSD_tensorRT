@@ -45,7 +45,12 @@ endif()
 
 add_library(iassd_trt_plugins SHARED
     farthest_point_sampling_plugin.cu
+    gather_points_plugin.cu
+    ball_query_plugin.cu
+    group_points_plugin.cu
     ../../pcdet/ops/pointnet2/pointnet2_batch/src/sampling_gpu.cu
+    ../../pcdet/ops/pointnet2/pointnet2_batch/src/ball_query_gpu.cu
+    ../../pcdet/ops/pointnet2/pointnet2_batch/src/group_points_gpu.cu
 )
 
 target_include_directories(iassd_trt_plugins PRIVATE
