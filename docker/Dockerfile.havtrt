@@ -1,0 +1,8 @@
+FROM ia-ssd-target:latest
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# pointcloud-3d-detector-tensorrt 빌드와 실행에 필요한 yaml-cpp 개발 패키지다.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libyaml-cpp-dev && \
+    rm -rf /var/lib/apt/lists/*

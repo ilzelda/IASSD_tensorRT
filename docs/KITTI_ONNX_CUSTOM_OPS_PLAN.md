@@ -969,6 +969,486 @@ IASSD_DEBUG_RANGE_CHECK=1 python3 tools/benchmark_iassd_ort_cuda.py \
 - GPU NMS post-processing 비교는 현재 target 환경에서 exit code `139`로 실패하므로, 정확한 rotated NMS parity는 별도 안정화 대상으로 둔다. 당장은 `--postprocess_mode numpy_nms`로 최종 detection 변화 방향을 추적한다.
 - 다음 단계는 second-only sorted TopK direct TensorRT engine을 여러 실제 sample에서 검증하고, PyTorch/base ORT/direct TensorRT의 latency benchmark를 같은 입력 조건에서 측정하는 것이다.
 
+### Jetson ROS 앱 1단계: TensorRT 단일 프레임 smoke
+
+지원 영역:
+
+- ONNX Runtime/TensorRT 추론
+- 변환 전후 추론 속도 비교
+
+진행 기록:
+
+- 상태: 완료
+- 완료일: 2026-06-12
+- Jetson target 컨테이너 `ia-ssd-target:latest`에서 TensorRT plugin을 빌드하고 direct TensorRT engine 단일 프레임 실행을 확인했다.
+- Jetson의 CMake 3.16 + CUDA 11.4 조합은 `CUDA17` 표준 플래그를 알지 못하므로, `tools/iassd_trt_plugins/CMakeLists.txt`의 CUDA 표준을 14로 낮췄다. plugin C++ host 표준은 기존처럼 C++17로 유지한다.
+- host `python3`에는 `torch`가 없어 직접 smoke는 실패했지만, target Docker 환경에서는 PyTorch/TensorRT 의존성이 잡혀 검증이 통과했다.
+- 기존 build cache는 host 경로(`/home/tisc/...`)와 컨테이너 경로(`/workspace/IA-SSD`)가 달라 충돌하므로, 컨테이너에서는 `tools/iassd_trt_plugins/build_target`을 사용했다.
+
+검증 명령:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "cd /workspace/IA-SSD && \
+   cmake -S tools/iassd_trt_plugins -B tools/iassd_trt_plugins/build_target && \
+   cmake --build tools/iassd_trt_plugins/build_target -j && \
+   python3 tools/validate_iassd_trt_engine.py \
+     --cfg_file tools/cfgs/kitti_models/IA-SSD.yaml \
+     --engine_file onnx_exports/stage2/ia_ssd_kitti_direct_trt_from_iassd_flat_fp32_sort_topk_second.engine \
+     --plugin_library tools/iassd_trt_plugins/build_target/libiassd_trt_plugins.so \
+     --num_points 16384 \
+     --skip_torch \
+     --skip_ort \
+     --report_file onnx_exports/stage7/jetson_step1_trt_smoke_report.json"
+```
+
+검증 결과:
+
+- report: `onnx_exports/stage7/jetson_step1_trt_smoke_report.json`
+- 입력 `points`: `[16384, 5]`, `torch.float32`, `cuda:0`
+- TensorRT 출력:
+  - `batch_cls_preds`: `[256, 3]`, `float32`
+  - `batch_box_preds`: `[256, 7]`, `float32`
+- 이 단계는 ROS subscribe와 시각화 전송 전, Jetson TensorRT runtime/plugin/engine 연결이 동작함을 확인하는 smoke 기준이다.
+
+### Jetson ROS 앱 2단계: `/lidar_sync` 입력과 MarkerArray publish
+
+지원 영역:
+
+- ROS1 포인트클라우드 입력
+- ONNX Runtime/TensorRT 추론
+- 변환 전후 추론 속도 비교
+
+진행 기록:
+
+- 상태: 완료
+- 완료일: 2026-06-12
+- `tools/iassd_trt_runtime.py`를 추가해 TensorRT engine/plugin 로딩과 `points` 입력 추론을 앱용 class로 분리했다.
+- `tools/iassd_postprocess.py`를 추가해 TensorRT raw output에서 score/label/box 후보를 만들고, CPU axis-aligned BEV NMS fallback으로 최종 detection을 만든다. 이 NMS는 ROS smoke용이며 정확한 CUDA rotated NMS parity는 별도 안정화 대상이다.
+- `tools/ros_iassd_trt_lidar_node.py`를 추가했다. `/lidar_sync` `sensor_msgs/PointCloud2`를 구독하고, IA-SSD TensorRT 추론 후 `/iassd_trt/boxes` `visualization_msgs/MarkerArray`를 publish한다.
+- PointCloud2 decoding은 `x, y, z` 필드를 필수로 보고 `intensity`가 없으면 0으로 채운다. field offset, `point_step`, row padding을 반영한다.
+- 전처리는 KITTI config의 `POINT_CLOUD_RANGE`를 적용하고 OpenPCDet `sample_points`와 같은 near/far sampling 규칙으로 `16384` points를 맞춘 뒤, batch index를 붙여 `[N, 5]` TensorRT 입력을 만든다.
+- 노드는 단계별 latency를 주기적으로 ROS log로 출력한다: decode, preprocess, TensorRT inference, postprocess, marker publish, total.
+
+검증:
+
+- host Python 문법 검사 통과:
+
+```bash
+python3 -m py_compile \
+  tools/iassd_trt_runtime.py \
+  tools/iassd_postprocess.py \
+  tools/ros_iassd_trt_lidar_node.py
+```
+
+- target Docker에서 ROS/TensorRT 노드 import 통과:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 -c 'import tools.ros_iassd_trt_lidar_node; print(\"node import ok\")'"
+```
+
+- 분리한 TensorRT runner 단일 입력 실행 통과:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 -c 'import torch; from tools.iassd_trt_runtime import IASSDTensorRTRunner; r=IASSDTensorRTRunner(\"onnx_exports/stage2/ia_ssd_kitti_direct_trt_from_iassd_flat_fp32_sort_topk_second.engine\", \"tools/iassd_trt_plugins/build_target/libiassd_trt_plugins.so\"); x=torch.zeros((16384,5), dtype=torch.float32, device=\"cuda\"); y=r.infer(x); print({k:v.shape for k,v in y.items()})'"
+```
+
+실행 예시:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 tools/ros_iassd_trt_lidar_node.py \
+     --cfg_file tools/cfgs/kitti_models/IA-SSD.yaml \
+     --engine_file onnx_exports/stage2/ia_ssd_kitti_direct_trt_from_iassd_flat_fp32_sort_topk_second.engine \
+     --plugin_library tools/iassd_trt_plugins/build_target/libiassd_trt_plugins.so \
+     --lidar_topic /lidar_sync \
+     --boxes_topic /iassd_trt/boxes \
+     --num_points 16384"
+```
+
+다음 단계:
+
+- Jetson에서 `/image_raw_sync`, `/lidar_sync`, `/iassd_trt/boxes`를 원격 시각화 머신 `192.168.0.241`에서 볼 수 있게 topic 재전송 정책을 추가한다.
+- 원격 RViz 기준으로 `/iassd_trt/lidar`, `/iassd_trt/image_raw` 또는 compressed image, `/iassd_trt/boxes`를 확인한다.
+
+### Jetson ROS 앱 3단계: 원격 시각화용 topic 재전송
+
+지원 영역:
+
+- ROS1 포인트클라우드 입력
+- ONNX Runtime/TensorRT 추론
+- 변환 전후 추론 속도 비교
+
+진행 기록:
+
+- 상태: 완료
+- 완료일: 2026-06-12
+- `tools/ros_iassd_trt_lidar_node.py`에 원격 RViz 확인용 topic 재전송 옵션을 추가했다.
+- LiDAR 재전송:
+  - `--republish_lidar raw`: 입력 `/lidar_sync` `PointCloud2`를 `/iassd_trt/lidar`로 그대로 publish한다.
+  - `--republish_lidar filtered`: KITTI `POINT_CLOUD_RANGE`로 필터링한 point cloud를 `/iassd_trt/lidar`로 publish한다.
+  - `--republish_lidar off`: LiDAR 재전송을 끈다.
+  - `--vis_point_stride`로 filtered visual point cloud만 stride downsample할 수 있다.
+- 이미지 재전송:
+  - `--republish_image raw`: 입력 `/image_raw_sync` `Image`를 `/iassd_trt/image_raw`로 그대로 publish한다.
+  - `--republish_image off`: 이미지 재전송을 끈다.
+- `/iassd_trt/boxes`는 기존처럼 `MarkerArray`로 publish한다.
+- 이 단계의 목적은 Jetson에서 추론한 결과를 display가 연결된 시각화 머신 `192.168.0.241`의 RViz에서 확인하는 것이다. ROS1 네트워크 연결은 같은 `ROS_MASTER_URI`와 각 머신의 `ROS_IP` 설정에 의존한다.
+
+검증:
+
+- host Python 문법 검사 통과:
+
+```bash
+python3 -m py_compile \
+  tools/iassd_trt_runtime.py \
+  tools/iassd_postprocess.py \
+  tools/ros_iassd_trt_lidar_node.py
+```
+
+- target Docker에서 ROS 노드 import 통과:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 -c 'import tools.ros_iassd_trt_lidar_node; print(\"node import ok\")'"
+```
+
+Jetson 실행 예시:
+
+```bash
+export ROS_MASTER_URI=http://<jetson_ip>:11311
+export ROS_IP=<jetson_ip>
+
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 tools/ros_iassd_trt_lidar_node.py \
+     --cfg_file tools/cfgs/kitti_models/IA-SSD.yaml \
+     --engine_file onnx_exports/stage2/ia_ssd_kitti_direct_trt_from_iassd_flat_fp32_sort_topk_second.engine \
+     --plugin_library tools/iassd_trt_plugins/build_target/libiassd_trt_plugins.so \
+     --lidar_topic /lidar_sync \
+     --image_topic /image_raw_sync \
+     --boxes_topic /iassd_trt/boxes \
+     --publish_lidar_topic /iassd_trt/lidar \
+     --publish_image_topic /iassd_trt/image_raw \
+     --republish_lidar raw \
+     --republish_image raw \
+     --num_points 16384"
+```
+
+시각화 머신 `192.168.0.241` 설정 예시:
+
+```bash
+export ROS_MASTER_URI=http://<jetson_ip>:11311
+export ROS_IP=192.168.0.241
+rviz
+```
+
+RViz 표시 항목:
+
+- `PointCloud2`: `/iassd_trt/lidar`
+- `MarkerArray`: `/iassd_trt/boxes`
+- `Image`: `/iassd_trt/image_raw`
+
+남은 제약:
+
+- raw image와 raw point cloud를 모두 전송하면 네트워크 대역폭이 커질 수 있다. 필요하면 다음 단계에서 `image_transport/compressed` 또는 `sensor_msgs/CompressedImage` publish 옵션을 추가한다.
+- 이미지 위 3D box overlay는 camera-LiDAR calibration과 projection 코드가 필요하므로 별도 단계로 둔다.
+
+### Jetson ROS 앱 4단계: PyTorch 실시간 baseline 노드
+
+지원 영역:
+
+- ROS1 포인트클라우드 입력
+- 변환 전후 추론 속도 비교
+
+진행 기록:
+
+- 상태: 완료
+- 완료일: 2026-06-12
+- `tools/ros_iassd_torch_lidar_node.py`를 추가했다.
+- 이 노드는 `/lidar_sync` `sensor_msgs/PointCloud2`를 구독하고, TensorRT 노드와 같은 전처리/후처리/MarkerArray publish 구조로 PyTorch IA-SSD baseline 결과를 `/iassd_torch/boxes`에 publish한다.
+- 입력 전처리는 TensorRT 노드와 같은 helper를 재사용한다:
+  - `x, y, z, intensity` 추출
+  - KITTI `POINT_CLOUD_RANGE` 필터
+  - OpenPCDet `sample_points`와 같은 near/far sampling
+  - batch index를 붙인 `[N, 5]` 입력 생성
+- 후처리는 TensorRT 노드와 같은 `tools/iassd_postprocess.py` CPU NMS fallback을 사용한다. 따라서 ROS 실시간 비교에서는 PyTorch와 TensorRT의 post-processing 차이를 줄이고 raw forward 경로 차이를 보기 쉽다.
+- OpenPCDet import 경로가 `spconv`를 먼저 찾으므로, IA-SSD처럼 sparse convolution을 쓰지 않는 모델을 위해 검증 스크립트와 같은 spconv import stub을 포함했다.
+
+검증:
+
+- host Python 문법 검사 통과:
+
+```bash
+python3 -m py_compile tools/ros_iassd_torch_lidar_node.py
+```
+
+- target Docker에서 노드 import 통과:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 -c 'import tools.ros_iassd_torch_lidar_node; print(\"torch node import ok\")'"
+```
+
+- target Docker에서 checkpoint 로딩과 단일 raw forward 통과:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 -c 'import torch; from tools.ros_iassd_torch_lidar_node import IASSDTorchRunner; r=IASSDTorchRunner(\"tools/cfgs/kitti_models/IA-SSD.yaml\", \"tools/IA-SSD.pth\", None); x=torch.zeros((16384,5), dtype=torch.float32, device=\"cuda\"); y=r.infer_raw(x); print({k:v.shape for k,v in y.items()})'"
+```
+
+검증 결과:
+
+- checkpoint: `tools/IA-SSD.pth`
+- loaded params: `221/221`
+- PyTorch 출력:
+  - `batch_cls_preds`: `[256, 3]`
+  - `batch_box_preds`: `[256, 7]`
+
+Jetson 실행 예시:
+
+```bash
+docker run -it --rm \
+  --name iassd_torch \
+  --runtime nvidia \
+  --net host \
+  -e ROS_MASTER_URI=http://192.168.0.190:11311 \
+  -e ROS_IP=192.168.0.190 \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 tools/ros_iassd_torch_lidar_node.py \
+     --cfg_file tools/cfgs/kitti_models/IA-SSD.yaml \
+     --ckpt tools/IA-SSD.pth \
+     --lidar_topic /lidar_sync \
+     --image_topic /image_raw_sync \
+     --boxes_topic /iassd_torch/boxes \
+     --republish_lidar off \
+     --republish_image off \
+     --score_thresh 0.01 \
+     --latency_log_interval 1 \
+     --num_points 16384"
+```
+
+RViz 비교 topic:
+
+- TensorRT boxes: `/iassd_trt/boxes`
+- PyTorch boxes: `/iassd_torch/boxes`
+- PointCloud2: `/iassd_trt/lidar` 또는 원본 `/lidar_sync`
+
+비교 시 주의:
+
+- PyTorch baseline과 TensorRT 노드를 동시에 실행하면 같은 `/lidar_sync`를 각각 처리하므로 GPU 부하가 합산된다. 속도 비교는 단독 실행과 동시 실행을 구분해 기록해야 한다.
+- 두 노드는 같은 seed 기본값 `1024`를 쓰지만, callback마다 sampling RNG 상태가 진행되므로 엄밀한 frame-level parity 비교가 필요하면 sampling index를 고정하거나 입력 point count가 항상 `16384`가 되도록 별도 deterministic 전처리를 추가한다.
+
+### Jetson profile: PyTorch vs direct TensorRT raw forward
+
+지원 영역:
+
+- ONNX Runtime/TensorRT 추론
+- 변환 전후 추론 속도 비교
+
+진행 기록:
+
+- 상태: 완료
+- 완료일: 2026-06-12
+- `tools/profile_iassd_torch_trt.py`를 추가해 ROS callback, PointCloud2 decode, topic publish를 제외한 PyTorch raw forward와 direct TensorRT 실행 시간을 분리 측정했다.
+- 측정 항목:
+  - `pytorch_raw_forward`: PyTorch IA-SSD raw forward
+  - `direct_trt_gpu_only`: TensorRT engine 실행만 측정, output GPU->CPU copy 제외
+  - `direct_trt_wrapper_with_cpu_copy`: ROS TensorRT 노드가 쓰는 wrapper 경로, output GPU->CPU copy 포함
+  - `pytorch_numpy_postprocess`, `trt_numpy_postprocess`: 공통 NumPy postprocess fallback
+
+검증 명령:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-target \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD && \
+   python3 tools/profile_iassd_torch_trt.py \
+     --cfg_file tools/cfgs/kitti_models/IA-SSD.yaml \
+     --ckpt tools/IA-SSD.pth \
+     --engine_file onnx_exports/stage2/ia_ssd_kitti_direct_trt_from_iassd_flat_fp32_sort_topk_second.engine \
+     --plugin_library tools/iassd_trt_plugins/build_target/libiassd_trt_plugins.so \
+     --num_points 16384 \
+     --warmup 10 \
+     --iterations 30 \
+     --score_thresh 0.01 \
+     --report_file onnx_exports/stage7/jetson_profile_torch_trt_raw_30.json"
+```
+
+측정 환경:
+
+- platform: `Linux-5.10.120-tegra-aarch64-with-glibc2.29`
+- CUDA device: `Orin`
+- PyTorch: `2.0.0a0+ec3941ad.nv23.02`
+- CUDA: `11.4`
+- input: `[16384, 5]`, `torch.float32`, `cuda:0`
+- warmup: `10`
+- iterations: `30`
+
+측정 결과:
+
+| 항목 | mean ms | fps |
+| --- | ---: | ---: |
+| PyTorch raw forward | 47.97 | 20.85 |
+| direct TensorRT GPU-only | 43.36 | 23.06 |
+| direct TensorRT wrapper + CPU output copy | 44.14 | 22.65 |
+| PyTorch NumPy postprocess | 0.40 | 2484.68 |
+| TensorRT NumPy postprocess | 0.30 | 3359.98 |
+
+해석:
+
+- ROS를 제외한 pure raw forward 기준에서는 TensorRT가 PyTorch보다 빠르다.
+- TensorRT GPU-only와 wrapper+CPU copy 차이는 약 `0.78ms`라 output CPU copy는 이번 측정에서 큰 병목은 아니다.
+- PyTorch가 실시간 실행에서 더 빨라 보인다면 raw inference보다는 ROS callback 구성 차이가 원인일 가능성이 높다.
+  - TensorRT 노드는 `/iassd_trt/lidar`, `/iassd_trt/image_raw/compressed`, `/iassd_trt/boxes`를 함께 publish하는 경우가 많다.
+  - PyTorch 노드는 비교 실행 예시에서 `--republish_lidar off`, `--republish_image off`로 둔 상태라 publish 비용이 더 작다.
+  - 두 노드를 동시에 실행하면 GPU와 ROS callback queue 부하가 합산되어 단독 latency와 달라진다.
+
+다음 액션:
+
+- TensorRT와 PyTorch 노드를 같은 publish 조건으로 맞춘 뒤 ROS callback latency를 비교한다.
+  - 공정한 inference 비교: 둘 다 `--republish_lidar off --republish_image off`
+  - 원격 시각화 포함 end-to-end 비교: 둘 다 같은 LiDAR/Image publish 정책 사용
+- 실제 `/lidar_sync` 입력에서 `decode`, `preprocess`, `infer`, `post`, `pub`, `total` 로그를 CSV로 저장하는 옵션을 추가한다.
+
+### Jetson profile: pointcloud-3d-detector-tensorrt submodule
+
+지원 영역:
+
+- ROS1 포인트클라우드 입력
+- ONNX Runtime/TensorRT 추론
+- 변환 전후 추론 속도 비교
+
+진행 기록:
+
+- 상태: 부분 완료
+- 완료일: 2026-06-12
+- submodule `pointcloud-3d-detector-tensorrt`를 추가해 HAV/GridBallQuery 기반 IA-SSD TensorRT 구현을 검토했다.
+- Jetson target Docker에서 빌드되도록 다음을 수정했다.
+  - `plugins/CMakeLists.txt`: Jetson CUDA library 경로 `${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib`를 search hint에 추가했다.
+  - `plugins/CMakeLists.txt`: Jetson CUDA 11.4 빌드 호환을 위해 plugin CUDA 표준을 14로 낮췄다.
+  - `src/point_detector.cpp`: ROS topic과 config를 런타임 private param으로 받도록 변경했다.
+    - `_config`
+    - `_input_topic`
+    - `_output_topic`
+  - `src/profile_detector.cpp`: ROS 없이 detector latency를 측정하는 profiler를 추가했다.
+  - `config/trt_hvcsx2.yaml`: GQ가 아닌 `iassd_hvcsx2_4x8_80e_kitti_3cls(export).onnx` 기반 FP16 config를 추가했다.
+  - `docker/Dockerfile.havtrt`: `ia-ssd-target`에 `libyaml-cpp-dev`를 더한 파생 image를 정의했다.
+
+빌드:
+
+```bash
+docker build -f docker/Dockerfile.havtrt -t ia-ssd-havtrt .
+
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-havtrt \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD/pointcloud-3d-detector-tensorrt && \
+   cmake -S . -B build_iassd_target \
+     -DCMAKE_BUILD_TYPE=Release \
+     -DTRT_QUANTIZE=FP16 \
+     -DTENSORRT_DIR=/usr \
+     -DCUDNN_DIR=/usr && \
+   cmake --build build_iassd_target -j"
+```
+
+프로파일:
+
+```bash
+docker run --runtime nvidia --rm --net host \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-havtrt \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD/pointcloud-3d-detector-tensorrt && \
+   ./build_iassd_target/devel/lib/point_detection/profile_detector \
+     --config config/trt_hvcsx2.yaml \
+     --warmup 10 \
+     --iterations 30"
+```
+
+측정 결과:
+
+| 항목 | mean ms | fps |
+| --- | ---: | ---: |
+| PyTorch raw forward | 47.97 | 20.85 |
+| 기존 direct TensorRT wrapper + CPU output copy | 44.14 | 22.65 |
+| submodule HAV TensorRT FP16 detector | 17.07 | 58.59 |
+
+해석:
+
+- submodule의 non-GQ HAV TensorRT FP16 detector는 synthetic 입력 기준 기존 PyTorch/직접 변환 TensorRT보다 뚜렷하게 빠르다.
+- submodule detector 측정은 입력 host->device copy, TensorRT 실행, output device->host copy, plugin NMS output까지 포함하는 `TRTDetector3D::operator()` 기준이다.
+- 현재 프로젝트의 기존 direct TensorRT는 원본 IA-SSD 구조와 parity를 유지하는 쪽이고, submodule은 HAV sampler와 plugin NMS를 포함한 별도 모델/ONNX라 정확도와 출력 의미는 별도 검증이 필요하다.
+- 기본 `config/trt.yaml`의 GQ variant(`iassd_hvcsx2_gq_...`)는 Orin에서 engine build 후 첫 inference가 30초 timeout 안에 반환되지 않았다. 따라서 현재 Jetson 실험 기본값은 `config/trt_hvcsx2.yaml`로 둔다.
+
+ROS 실행 예시:
+
+```bash
+docker run -it --rm \
+  --name iassd_havtrt \
+  --runtime nvidia \
+  --net host \
+  -e ROS_MASTER_URI=http://192.168.0.190:11311 \
+  -e ROS_IP=192.168.0.190 \
+  -v /home/tisc/data/sangjune/IA-SSD:/workspace/IA-SSD \
+  ia-ssd-havtrt \
+  "source /opt/ros/noetic/setup.bash && \
+   cd /workspace/IA-SSD/pointcloud-3d-detector-tensorrt && \
+   ./build_iassd_target/devel/lib/point_detection/point_detector \
+     _config:=config/trt_hvcsx2.yaml \
+     _input_topic:=/lidar_sync \
+     _output_topic:=/iassd_havtrt/boxes"
+```
+
+RViz 비교 topic:
+
+- 기존 TensorRT: `/iassd_trt/boxes`
+- PyTorch: `/iassd_torch/boxes`
+- submodule HAV TensorRT: `/iassd_havtrt/boxes`
+
+남은 작업:
+
+- 실제 `/lidar_sync` 입력에서 submodule HAV TensorRT의 marker가 좌표계/크기/heading 기준으로 정상 표시되는지 확인한다.
+- submodule 모델은 별도 ONNX/checkpoint 계열이므로, 현재 `tools/IA-SSD.pth` 기반 PyTorch baseline과 detection 품질을 직접 비교하려면 동일 sample에 대한 정성/정량 검증이 필요하다.
+- GQ variant hang 원인을 별도 분석한다. 후보는 GridBallQuery plugin의 Orin/TensorRT 8.5 호환성, CUDA arch flag, 입력 분포, plugin workspace/shape 처리다.
+
 ## 개발 우선순위
 
 1. KITTI raw PyTorch output shape 저장

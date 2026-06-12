@@ -1,0 +1,3 @@
+[submodule "pointcloud-3d-detector-tensorrt"]
+	path = pointcloud-3d-detector-tensorrt
+	url = https://github.com/OuyangJunyuan/pointcloud-3d-detector-tensorrt.git

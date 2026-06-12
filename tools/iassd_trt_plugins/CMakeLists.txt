@@ -4,7 +4,9 @@ project(iassd_trt_plugins LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
+# Jetson의 CMake 3.16 + CUDA 11.4 조합은 CUDA17 플래그를 알지 못한다.
+# plugin CUDA 코드는 C++17 전용 문법을 쓰지 않으므로 nvcc 표준은 CUDA14로 둔다.
+set(CMAKE_CUDA_STANDARD 14)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
