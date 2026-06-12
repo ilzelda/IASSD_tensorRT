@@ -23,6 +23,16 @@ from validate_iassd_ort_model import (
     tensor_to_numpy,
     TOOLS_DIR,
 )
+from validate_iassd_trt_engine import (
+    TRT_DTYPE_TO_TORCH,
+    execute_context,
+    get_tensor_dtype,
+    get_tensor_name,
+    get_tensor_shape,
+    is_input_tensor,
+    load_trt_engine,
+    set_input_shape_if_needed,
+)
 
 
 install_spconv_import_stub()
@@ -36,6 +46,7 @@ def parse_args():
     parser.add_argument('--ckpt', type=str, default='tools/IA-SSD.pth')
     parser.add_argument('--onnx_file', type=str, required=True, help='benchmark할 IA-SSD ONNX 파일')
     parser.add_argument('--ort_op_library', type=str, required=True, help='libiassd_ort_ops.so 경로')
+    parser.add_argument('--trt_engine_file', type=str, default=None, help='선택 측정할 direct TensorRT engine 파일')
     parser.add_argument('--trt_plugin_library', type=str, default=None, help='TensorRT plugin library 경로')
     parser.add_argument('--sample_data_path', type=str, default=None, help='샘플 포인트클라우드 파일 또는 디렉터리 경로')
     parser.add_argument('--sample_ext', type=str, default='.bin', help='샘플 포인트클라우드 확장자')
@@ -181,6 +192,70 @@ def time_ort_iobinding_copy_outputs(session, points_np, warmup, iterations, devi
     return timings
 
 
+def make_trt_runner(engine, points):
+    context = engine.create_execution_context()
+    if context is None:
+        raise RuntimeError('TensorRT execution context 생성 실패')
+
+    tensor_count = engine.num_io_tensors if hasattr(engine, 'num_io_tensors') else engine.num_bindings
+    input_names = []
+    output_names = []
+    bindings = {}
+    output_tensors = {}
+
+    for index in range(tensor_count):
+        name = get_tensor_name(engine, index)
+        if is_input_tensor(engine, name, index):
+            input_names.append(name)
+        else:
+            output_names.append(name)
+
+    if len(input_names) != 1:
+        raise RuntimeError(f'현재 benchmark는 입력 1개 engine만 지원합니다: inputs={input_names}')
+
+    input_name = input_names[0]
+    trt_points = points.contiguous()
+    set_input_shape_if_needed(context, engine, input_name, trt_points)
+    bindings[input_name] = int(trt_points.data_ptr())
+
+    for index in range(tensor_count):
+        name = get_tensor_name(engine, index)
+        if name == input_name:
+            continue
+        shape = get_tensor_shape(engine, context, name, index)
+        trt_dtype = get_tensor_dtype(engine, name, index)
+        torch_dtype = TRT_DTYPE_TO_TORCH.get(trt_dtype)
+        if torch_dtype is None:
+            raise RuntimeError(f'지원하지 않는 TensorRT dtype입니다: {name} {trt_dtype}')
+        output_tensor = torch.empty(shape, dtype=torch_dtype, device=trt_points.device)
+        output_tensors[name] = output_tensor
+        bindings[name] = int(output_tensor.data_ptr())
+
+    return context, bindings, output_names, output_tensors
+
+
+def time_trt_engine(engine, points, warmup, iterations):
+    context, bindings, _, _ = make_trt_runner(engine, points)
+    stream = torch.cuda.current_stream().cuda_stream
+
+    for _ in range(warmup):
+        ok = execute_context(context, engine, bindings, stream)
+        if not ok:
+            raise RuntimeError('TensorRT engine 실행 실패')
+    torch.cuda.synchronize()
+
+    timings = []
+    for _ in range(iterations):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        ok = execute_context(context, engine, bindings, stream)
+        if not ok:
+            raise RuntimeError('TensorRT engine 실행 실패')
+        torch.cuda.synchronize()
+        timings.append((time.perf_counter() - start) * 1000.0)
+    return timings
+
+
 def build_runtime_report(args, cfg_file, ckpt_file, onnx_file, ort_op_library, points, providers, session):
     cuda_device = torch.cuda.current_device()
     return {
@@ -201,6 +276,8 @@ def build_runtime_report(args, cfg_file, ckpt_file, onnx_file, ort_op_library, p
             'ckpt': str(ckpt_file),
             'onnx_file': str(onnx_file),
             'ort_op_library': str(ort_op_library),
+            'trt_engine_file': str(Path(args.trt_engine_file).resolve()) if args.trt_engine_file else None,
+            'trt_plugin_library': str(Path(args.trt_plugin_library).resolve()) if args.trt_plugin_library else None,
             'providers_requested': providers,
             'providers_active': session.get_providers(),
             'num_points': args.num_points,
@@ -234,6 +311,8 @@ def main():
         raise FileNotFoundError(f'ONNX 파일이 없습니다: {onnx_file}')
     if not ort_op_library.exists():
         raise FileNotFoundError(f'custom op library가 없습니다: {ort_op_library}')
+    if args.trt_engine_file is not None and args.trt_plugin_library is None:
+        raise ValueError('--trt_engine_file을 쓰려면 --trt_plugin_library가 필요합니다.')
     if not cfg_file.exists():
         raise FileNotFoundError(f'config 파일이 없습니다: {cfg_file}')
     if not ckpt_file.exists():
@@ -287,6 +366,14 @@ def main():
                     cuda_device,
                 )
             )
+
+    if args.trt_engine_file is not None:
+        engine_path, plugin_path, engine = load_trt_engine(args.trt_engine_file, args.trt_plugin_library)
+        report['config']['trt_engine_file'] = str(engine_path)
+        report['config']['trt_plugin_library'] = str(plugin_path)
+        report['direct_trt_engine_run'] = summarize_ms(
+            time_trt_engine(engine, points, args.warmup, args.iterations)
+        )
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
